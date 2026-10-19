@@ -138,6 +138,7 @@ use crate::security::EntryValidator;
 use crate::security::permissions::SanitizedMode;
 use crate::security::quota::QuotaPermit;
 use crate::security::validator::ValidatedEntryType;
+use crate::security::zipbomb::DeclaredCompressedBudget;
 use crate::types::DestDir;
 use crate::types::EntryType;
 use crate::types::SafePath;
@@ -161,6 +162,7 @@ struct ZipExtractionContext<'a> {
     report: &'a mut ExtractionReport,
     copy_buffer: &'a mut CopyBuffer,
     dir_cache: &'a mut common::DirCache,
+    compressed_budget: &'a mut DeclaredCompressedBudget,
     skip_duplicates: bool,
     /// Count of file/symlink entries skipped as pre-existing duplicates,
     /// threaded through `common::extract_file_with_permit` and
@@ -368,6 +370,7 @@ impl<R: Read + Seek> ZipArchive<R> {
         let path = Self::resolve_entry_path(&zip_file, index, ctx.config.allowed.absolute_paths)?;
 
         let (uncompressed_size, compressed_size) = ZipEntryAdapter::get_sizes(&zip_file);
+        ctx.compressed_budget.charge(compressed_size)?;
         let mode = zip_file.unix_mode();
 
         let compression = ZipEntryAdapter::get_compression_method(&zip_file);
@@ -527,6 +530,9 @@ impl<R: Read + Seek> ArchiveFormat for ZipArchive<R> {
 
         let mut dir_cache = common::DirCache::new();
 
+        let mut compressed_budget =
+            DeclaredCompressedBudget::new(self.inner.central_directory_start());
+
         // Aggregated into a single warning after extraction instead of one
         // per skipped entry, mirroring 7z's `duplicate_skips` accumulator
         // (issue #490).
@@ -579,6 +585,7 @@ impl<R: Read + Seek> ArchiveFormat for ZipArchive<R> {
                 report: &mut report,
                 copy_buffer: &mut copy_buffer,
                 dir_cache: &mut dir_cache,
+                compressed_budget: &mut compressed_budget,
                 skip_duplicates,
                 duplicate_skips: &mut duplicate_skips,
                 disallowed_extension_skips: &mut disallowed_extension_skips,
@@ -1839,8 +1846,9 @@ mod tests {
         let zip_data = create_large_archive_with_encrypted_entry(0);
         let cursor = Cursor::new(zip_data);
         let result = ZipArchive::new(cursor);
-        assert!(
-            matches!(result, Err(ArchiveError::SecurityViolation { .. })),
+        assert_matches!(
+            result.err(),
+            Some(ArchiveError::SecurityViolation { .. }),
             "expected SecurityViolation for encrypted entry in first batch"
         );
     }
@@ -1851,8 +1859,9 @@ mod tests {
         let zip_data = create_large_archive_with_encrypted_entry(200);
         let cursor = Cursor::new(zip_data);
         let result = ZipArchive::new(cursor);
-        assert!(
-            matches!(result, Err(ArchiveError::SecurityViolation { .. })),
+        assert_matches!(
+            result.err(),
+            Some(ArchiveError::SecurityViolation { .. }),
             "expected SecurityViolation for encrypted entry in middle batch"
         );
     }
@@ -1863,8 +1872,9 @@ mod tests {
         let zip_data = create_large_archive_with_encrypted_entry(399);
         let cursor = Cursor::new(zip_data);
         let result = ZipArchive::new(cursor);
-        assert!(
-            matches!(result, Err(ArchiveError::SecurityViolation { .. })),
+        assert_matches!(
+            result.err(),
+            Some(ArchiveError::SecurityViolation { .. }),
             "expected SecurityViolation for encrypted entry in last batch"
         );
     }
@@ -1896,8 +1906,9 @@ mod tests {
         let zip_data = create_large_archive_with_encrypted_entry(125);
         let cursor = Cursor::new(zip_data);
         let result = ZipArchive::new(cursor);
-        assert!(
-            matches!(result, Err(ArchiveError::SecurityViolation { .. })),
+        assert_matches!(
+            result.err(),
+            Some(ArchiveError::SecurityViolation { .. }),
             "full scan must detect encrypted entry at index 125"
         );
     }
@@ -2127,8 +2138,8 @@ mod tests {
 
         let manifest = archive.list(&config).unwrap();
 
-        assert_eq!(manifest.total_entries, 2);
-        assert_eq!(manifest.total_size, 10);
+        assert_eq!(manifest.total_entries(), 2);
+        assert_eq!(manifest.total_size(), 10);
     }
 
     #[test]
@@ -2139,8 +2150,8 @@ mod tests {
 
         let manifest = archive.list(&config).unwrap();
 
-        assert_eq!(manifest.total_entries, 0);
-        assert_eq!(manifest.total_size, 0);
+        assert_eq!(manifest.total_entries(), 0);
+        assert_eq!(manifest.total_size(), 0);
     }
 
     #[test]
@@ -2152,7 +2163,7 @@ mod tests {
         let report = archive.verify(&config).unwrap();
 
         assert!(report.is_safe());
-        assert_eq!(report.total_entries, 1);
+        assert_eq!(report.total_entries(), 1);
     }
 
     #[test]

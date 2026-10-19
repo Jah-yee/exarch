@@ -42,6 +42,41 @@ pub fn validate_compression_ratio(
     Ok(())
 }
 
+/// Bounds the sum of declared compressed sizes by the archive's data region.
+///
+/// Each entry's declared compressed size is charged against the budget, so
+/// the sizes of all entries together never exceed the space the archive can
+/// actually hold. Entries that declare more data than remains are rejected,
+/// which keeps per-entry compression-ratio checks anchored to real archive
+/// bytes.
+#[derive(Debug)]
+pub struct DeclaredCompressedBudget {
+    remaining: u64,
+}
+
+impl DeclaredCompressedBudget {
+    /// Creates a budget of `data_region` bytes, the archive space that can
+    /// hold compressed entry data.
+    pub const fn new(data_region: u64) -> Self {
+        Self {
+            remaining: data_region,
+        }
+    }
+
+    /// Charges one declared compressed size against the budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArchiveError::InvalidArchive`] when `declared` exceeds what
+    /// is left of the budget.
+    pub fn charge(&mut self, declared: u64) -> Result<()> {
+        self.remaining = self.remaining.checked_sub(declared).ok_or_else(|| {
+            ArchiveError::InvalidArchive("declared compressed size exceeds archive length".into())
+        })?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
@@ -72,6 +107,30 @@ mod tests {
             result,
             Err(ArchiveError::InvalidArchive(_)),
             "zero compressed with non-zero uncompressed should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_declared_budget_accepts_sizes_within_region() {
+        let mut budget = DeclaredCompressedBudget::new(100);
+        budget.charge(60).expect("fits");
+        budget.charge(40).expect("fits exactly");
+        budget.charge(0).expect("zero is free");
+    }
+
+    #[test]
+    fn test_declared_budget_rejects_cumulative_overrun() {
+        let mut budget = DeclaredCompressedBudget::new(100);
+        budget.charge(60).expect("fits");
+        assert_matches!(budget.charge(41), Err(ArchiveError::InvalidArchive(_)));
+    }
+
+    #[test]
+    fn test_declared_budget_rejects_u64_max() {
+        let mut budget = DeclaredCompressedBudget::new(u64::MAX - 1);
+        assert_matches!(
+            budget.charge(u64::MAX),
+            Err(ArchiveError::InvalidArchive(_))
         );
     }
 

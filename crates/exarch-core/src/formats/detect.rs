@@ -5,6 +5,8 @@ use std::path::Path;
 
 use crate::ArchiveError;
 use crate::Result;
+use crate::closed_enum::closed_enum;
+use crate::formats::compression::CompressionCodec;
 
 /// Number of bytes to read for magic-byte detection.
 ///
@@ -50,27 +52,53 @@ pub(crate) fn is_zip_family_alias(ext: &str) -> bool {
     ZIP_FAMILY_ALIASES.contains(&lower.as_str())
 }
 
-/// Supported archive formats.
-///
-/// `#[non_exhaustive]` so support for a new archive format is not a
-/// breaking change for downstream matches.
+closed_enum! {
+    /// Supported archive formats.
+    ///
+    /// `#[non_exhaustive]` so support for a new archive format is not a
+    /// breaking change for downstream matches.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub enum ArchiveType {
+        /// Tar archive (uncompressed).
+        Tar => "Tar",
+        /// Gzip-compressed tar archive.
+        TarGz => "TarGz",
+        /// Bzip2-compressed tar archive.
+        TarBz2 => "TarBz2",
+        /// XZ-compressed tar archive.
+        TarXz => "TarXz",
+        /// Zstd-compressed tar archive.
+        TarZst => "TarZst",
+        /// ZIP archive.
+        Zip => "Zip",
+        /// 7z archive.
+        SevenZ => "SevenZ",
+    }
+}
+
+/// How an [`ArchiveType`] is read: a TAR stream with an optional codec, or a
+/// container format with its own handler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum ArchiveType {
-    /// Tar archive (uncompressed).
-    Tar,
-    /// Gzip-compressed tar archive.
-    TarGz,
-    /// Bzip2-compressed tar archive.
-    TarBz2,
-    /// XZ-compressed tar archive.
-    TarXz,
-    /// Zstd-compressed tar archive.
-    TarZst,
-    /// ZIP archive.
+pub(crate) enum FormatFamily {
+    Tar(Option<CompressionCodec>),
     Zip,
-    /// 7z archive.
     SevenZ,
+}
+
+impl ArchiveType {
+    /// Groups this type by the reader that handles it.
+    pub(crate) const fn family(self) -> FormatFamily {
+        match self {
+            Self::Tar => FormatFamily::Tar(None),
+            Self::TarGz => FormatFamily::Tar(Some(CompressionCodec::Gzip)),
+            Self::TarBz2 => FormatFamily::Tar(Some(CompressionCodec::Bzip2)),
+            Self::TarXz => FormatFamily::Tar(Some(CompressionCodec::Xz)),
+            Self::TarZst => FormatFamily::Tar(Some(CompressionCodec::Zstd)),
+            Self::Zip => FormatFamily::Zip,
+            Self::SevenZ => FormatFamily::SevenZ,
+        }
+    }
 }
 
 /// Detects the archive type from a file path using two-phase detection.
@@ -81,8 +109,8 @@ pub enum ArchiveType {
 ///
 /// **Phase 1 — extension:** maps the file extension to an [`ArchiveType`] using
 /// the same rules as before. `.gz` is only accepted when the stem ends with
-/// `.tar` (e.g. `archive.tar.gz`); a bare `archive.gz` is not a recognised
-/// extension.
+/// `.tar`, compared case-insensitively (e.g. `archive.tar.gz`,
+/// `ARCHIVE.TAR.GZ`); a bare `archive.gz` is not a recognised extension.
 ///
 /// **Phase 2 — magic bytes:** when extension detection fails (unrecognised or
 /// missing extension), the function reads up to the first 262 bytes of the file
@@ -151,7 +179,10 @@ pub(crate) fn detect_format_from_extension(path: &Path) -> Result<ArchiveType> {
         "tgz" => Ok(ArchiveType::TarGz),
         "gz" => {
             if let Some(stem) = path.file_stem()
-                && stem.to_string_lossy().ends_with(".tar")
+                && stem
+                    .as_encoded_bytes()
+                    .last_chunk::<4>()
+                    .is_some_and(|tail| tail.eq_ignore_ascii_case(b".tar"))
             {
                 Ok(ArchiveType::TarGz)
             } else {
@@ -217,6 +248,41 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
+    fn test_archive_type_as_str_matches_display_and_is_unique() {
+        let names: Vec<&str> = ArchiveType::ALL.iter().map(|t| t.as_str()).collect();
+        assert_eq!(
+            names,
+            ["Tar", "TarGz", "TarBz2", "TarXz", "TarZst", "Zip", "SevenZ"]
+        );
+        for t in ArchiveType::ALL {
+            assert_eq!(t.to_string(), t.as_str());
+        }
+    }
+
+    #[test]
+    fn test_family_maps_tar_codecs() {
+        assert_eq!(ArchiveType::Tar.family(), FormatFamily::Tar(None));
+        assert_eq!(
+            ArchiveType::TarGz.family(),
+            FormatFamily::Tar(Some(CompressionCodec::Gzip))
+        );
+        assert_eq!(
+            ArchiveType::TarBz2.family(),
+            FormatFamily::Tar(Some(CompressionCodec::Bzip2))
+        );
+        assert_eq!(
+            ArchiveType::TarXz.family(),
+            FormatFamily::Tar(Some(CompressionCodec::Xz))
+        );
+        assert_eq!(
+            ArchiveType::TarZst.family(),
+            FormatFamily::Tar(Some(CompressionCodec::Zstd))
+        );
+        assert_eq!(ArchiveType::Zip.family(), FormatFamily::Zip);
+        assert_eq!(ArchiveType::SevenZ.family(), FormatFamily::SevenZ);
+    }
+
+    #[test]
     fn test_detect_tar() {
         let path = PathBuf::from("archive.tar");
         assert_eq!(detect_format(&path).unwrap(), ArchiveType::Tar);
@@ -229,6 +295,25 @@ mod tests {
 
         let path2 = PathBuf::from("archive.tgz");
         assert_eq!(detect_format(&path2).unwrap(), ArchiveType::TarGz);
+    }
+
+    #[test]
+    fn test_detect_tar_gz_stem_is_case_insensitive() {
+        for name in ["a.TAR.gz", "a.Tar.GZ", "A.TAR.GZ"] {
+            assert_eq!(
+                detect_format(&PathBuf::from(name)).unwrap(),
+                ArchiveType::TarGz,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_detect_bare_dot_tar_gz_still_matches() {
+        assert_eq!(
+            detect_format_from_extension(Path::new(".tar.gz")).unwrap(),
+            ArchiveType::TarGz
+        );
     }
 
     #[test]

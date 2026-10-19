@@ -245,7 +245,7 @@ impl PyArchiveEntry {
 
     #[getter]
     fn entry_type(&self) -> String {
-        self.inner.entry_type.to_string()
+        self.inner.entry_type.as_str().to_owned()
     }
 
     #[getter]
@@ -325,33 +325,35 @@ pub struct PyArchiveManifest {
 impl PyArchiveManifest {
     #[getter]
     fn total_entries(&self) -> usize {
-        self.inner.total_entries
+        self.inner.total_entries()
     }
 
     #[getter]
     fn total_size(&self) -> u64 {
-        self.inner.total_size
+        self.inner.total_size()
     }
 
     #[getter]
     fn entries(&self) -> Vec<PyArchiveEntry> {
         self.inner
-            .entries
-            .clone()
-            .into_iter()
+            .entries()
+            .iter()
+            .cloned()
             .map(PyArchiveEntry::from)
             .collect()
     }
 
     #[getter]
     fn format(&self) -> String {
-        format!("{:?}", self.inner.format)
+        self.inner.format().as_str().to_owned()
     }
 
     fn __str__(&self) -> String {
         format!(
-            "ArchiveManifest(entries={}, total_size={} bytes, format={:?})",
-            self.inner.total_entries, self.inner.total_size, self.inner.format
+            "ArchiveManifest(entries={}, total_size={} bytes, format={})",
+            self.inner.total_entries(),
+            self.inner.total_size(),
+            self.inner.format()
         )
     }
 
@@ -383,7 +385,7 @@ pub struct PyVerificationIssue {
 impl PyVerificationIssue {
     #[getter]
     fn severity(&self) -> String {
-        self.inner.severity.to_string()
+        self.inner.severity.as_str().to_owned()
     }
 
     #[getter]
@@ -401,7 +403,7 @@ impl PyVerificationIssue {
 
     #[getter]
     fn category(&self) -> String {
-        self.inner.category.to_string()
+        self.inner.category.as_str().to_owned()
     }
 
     #[getter]
@@ -442,37 +444,37 @@ pub struct PyVerificationReport {
 impl PyVerificationReport {
     #[getter]
     fn status(&self) -> String {
-        self.inner.status.to_string()
+        self.inner.status().as_str().to_owned()
     }
 
     #[getter]
     fn issues(&self) -> Vec<PyVerificationIssue> {
         self.inner
-            .issues
-            .clone()
-            .into_iter()
+            .issues()
+            .iter()
+            .cloned()
             .map(PyVerificationIssue::from)
             .collect()
     }
 
     #[getter]
     fn total_entries(&self) -> usize {
-        self.inner.total_entries
+        self.inner.total_entries()
     }
 
     #[getter]
     fn total_size(&self) -> u64 {
-        self.inner.total_size
+        self.inner.total_size()
     }
 
     #[getter]
     fn integrity_status(&self) -> String {
-        self.inner.integrity_status.to_string()
+        self.inner.integrity_status().as_str().to_owned()
     }
 
     #[getter]
     fn security_status(&self) -> String {
-        self.inner.security_status.to_string()
+        self.inner.security_status().as_str().to_owned()
     }
 
     fn is_safe(&self) -> bool {
@@ -486,9 +488,9 @@ impl PyVerificationReport {
     fn __str__(&self) -> String {
         format!(
             "VerificationReport(status={}, issues={}, entries={})",
-            self.inner.status,
-            self.inner.issues.len(),
-            self.inner.total_entries
+            self.inner.status(),
+            self.inner.issues().len(),
+            self.inner.total_entries()
         )
     }
 
@@ -746,16 +748,10 @@ mod tests {
     fn test_archive_entry_properties() {
         use std::path::PathBuf;
 
-        let entry = ArchiveEntry {
-            path: PathBuf::from("test/file.txt"),
-            size: 512,
-            entry_type: ManifestEntryType::File,
-            compressed_size: Some(256),
-            mode: Some(0o644),
-            modified: None,
-            symlink_target: None,
-            hardlink_target: None,
-        };
+        let mut entry =
+            ArchiveEntry::new(PathBuf::from("test/file.txt"), ManifestEntryType::File, 512);
+        entry.compressed_size = Some(256);
+        entry.mode = Some(0o644);
 
         let py_entry = PyArchiveEntry::from(entry);
 
@@ -781,16 +777,8 @@ mod tests {
     fn test_archive_entry_symlink() {
         use std::path::PathBuf;
 
-        let entry = ArchiveEntry {
-            path: PathBuf::from("link"),
-            size: 0,
-            entry_type: ManifestEntryType::Symlink,
-            compressed_size: None,
-            mode: None,
-            modified: None,
-            symlink_target: Some(PathBuf::from("target/file.txt")),
-            hardlink_target: None,
-        };
+        let mut entry = ArchiveEntry::new(PathBuf::from("link"), ManifestEntryType::Symlink, 0);
+        entry.symlink_target = Some(PathBuf::from("target/file.txt"));
 
         let py_entry = PyArchiveEntry::from(entry);
 
@@ -807,16 +795,9 @@ mod tests {
     fn test_archive_entry_hardlink() {
         use std::path::PathBuf;
 
-        let entry = ArchiveEntry {
-            path: PathBuf::from("hardlink"),
-            size: 0,
-            entry_type: ManifestEntryType::Hardlink,
-            compressed_size: None,
-            mode: None,
-            modified: None,
-            symlink_target: None,
-            hardlink_target: Some(PathBuf::from("original/file.txt")),
-        };
+        let mut entry =
+            ArchiveEntry::new(PathBuf::from("hardlink"), ManifestEntryType::Hardlink, 0);
+        entry.hardlink_target = Some(PathBuf::from("original/file.txt"));
 
         let py_entry = PyArchiveEntry::from(entry);
 
@@ -834,35 +815,11 @@ mod tests {
         use exarch_core::formats::detect::ArchiveType;
         use std::path::PathBuf;
 
-        let entries = vec![
-            ArchiveEntry {
-                path: PathBuf::from("file1.txt"),
-                size: 100,
-                entry_type: ManifestEntryType::File,
-                compressed_size: None,
-                mode: None,
-                modified: None,
-                symlink_target: None,
-                hardlink_target: None,
-            },
-            ArchiveEntry {
-                path: PathBuf::from("file2.txt"),
-                size: 200,
-                entry_type: ManifestEntryType::File,
-                compressed_size: None,
-                mode: None,
-                modified: None,
-                symlink_target: None,
-                hardlink_target: None,
-            },
-        ];
-
-        let manifest = ArchiveManifest {
-            total_entries: 2,
-            total_size: 300,
-            entries,
-            format: ArchiveType::Tar,
-        };
+        let mut manifest = ArchiveManifest::new(ArchiveType::Tar);
+        for (name, size) in [("file1.txt", 100), ("file2.txt", 200)] {
+            let entry = ArchiveEntry::new(PathBuf::from(name), ManifestEntryType::File, size);
+            manifest.add_entry(entry).unwrap();
+        }
 
         let py_manifest = PyArchiveManifest::from(manifest);
 
@@ -886,13 +843,13 @@ mod tests {
         use exarch_core::inspection::report::IssueSeverity;
         use std::path::PathBuf;
 
-        let issue = VerificationIssue {
-            severity: IssueSeverity::Critical,
-            message: "Path traversal detected".to_string(),
-            entry_path: Some(PathBuf::from("../etc/passwd")),
-            category: IssueCategory::PathTraversal,
-            context: Some("Entry attempts to escape extraction directory".to_string()),
-        };
+        let mut issue = VerificationIssue::new(
+            IssueSeverity::Critical,
+            IssueCategory::PathTraversal,
+            "Path traversal detected".to_string(),
+        );
+        issue.entry_path = Some(PathBuf::from("../etc/passwd"));
+        issue.context = Some("Entry attempts to escape extraction directory".to_string());
 
         let py_issue = PyVerificationIssue::from(issue);
 
@@ -919,6 +876,45 @@ mod tests {
              and exarch-node's own convention)"
         );
         assert!(py_issue.context().is_some(), "context should be Some");
+    }
+
+    fn literal_line<T: Copy>(alias: &str, all: &[T], as_str: fn(T) -> &'static str) -> String {
+        let values: Vec<String> = all.iter().map(|v| format!("\"{}\"", as_str(*v))).collect();
+        format!("{alias} = Literal[{}]", values.join(", "))
+    }
+
+    #[test]
+    fn test_pyi_literal_aliases_match_core_enums() {
+        use exarch_core::formats::detect::ArchiveType;
+        use exarch_core::inspection::CheckStatus;
+        use exarch_core::inspection::IssueCategory;
+        use exarch_core::inspection::IssueSeverity;
+        use exarch_core::inspection::VerificationStatus;
+
+        let pyi = include_str!("../exarch.pyi");
+        let expected = [
+            literal_line("_ArchiveType", ArchiveType::ALL, ArchiveType::as_str),
+            literal_line(
+                "_ManifestEntryType",
+                ManifestEntryType::ALL,
+                ManifestEntryType::as_str,
+            ),
+            literal_line(
+                "_VerificationStatus",
+                VerificationStatus::ALL,
+                VerificationStatus::as_str,
+            ),
+            literal_line("_CheckStatus", CheckStatus::ALL, CheckStatus::as_str),
+            literal_line("_IssueSeverity", IssueSeverity::ALL, IssueSeverity::as_str),
+            literal_line("_IssueCategory", IssueCategory::ALL, IssueCategory::as_str),
+        ];
+        for line in expected {
+            assert!(
+                pyi.lines()
+                    .any(|l| l.split("  # ").next() == Some(line.as_str())),
+                "exarch.pyi is out of sync with exarch-core, expected line:\n{line}"
+            );
+        }
     }
 
     // NOTE: VerificationReport tests removed as they depend on types that may

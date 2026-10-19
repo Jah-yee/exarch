@@ -184,13 +184,13 @@ impl<W: Write> OutputFormatter for JsonFormatter<W> {
 
         #[derive(Serialize)]
         struct ManifestOutput {
-            format: String,
+            format: &'static str,
             total_entries: usize,
             entries: Vec<ManifestEntry>,
         }
 
         let entries = manifest
-            .entries
+            .entries()
             .iter()
             .map(|e| ManifestEntry {
                 path: e.path.display().to_string(),
@@ -198,8 +198,8 @@ impl<W: Write> OutputFormatter for JsonFormatter<W> {
             .collect();
 
         let data = ManifestOutput {
-            format: format!("{:?}", manifest.format),
-            total_entries: manifest.total_entries,
+            format: manifest.format().as_str(),
+            total_entries: manifest.total_entries(),
             entries,
         };
 
@@ -215,7 +215,7 @@ impl<W: Write> OutputFormatter for JsonFormatter<W> {
         #[derive(Serialize)]
         struct ManifestEntry {
             path: String,
-            entry_type: String,
+            entry_type: &'static str,
             size: u64,
             #[serde(skip_serializing_if = "Option::is_none")]
             compressed_size: Option<u64>,
@@ -231,18 +231,18 @@ impl<W: Write> OutputFormatter for JsonFormatter<W> {
 
         #[derive(Serialize)]
         struct ManifestOutput {
-            format: String,
+            format: &'static str,
             total_entries: usize,
             total_size: u64,
             entries: Vec<ManifestEntry>,
         }
 
         let entries = manifest
-            .entries
+            .entries()
             .iter()
             .map(|e| ManifestEntry {
                 path: e.path.display().to_string(),
-                entry_type: format!("{}", e.entry_type),
+                entry_type: e.entry_type.as_str(),
                 size: e.size,
                 compressed_size: e.compressed_size,
                 mode: e.mode,
@@ -257,9 +257,9 @@ impl<W: Write> OutputFormatter for JsonFormatter<W> {
             .collect();
 
         let data = ManifestOutput {
-            format: format!("{:?}", manifest.format),
-            total_entries: manifest.total_entries,
-            total_size: manifest.total_size,
+            format: manifest.format().as_str(),
+            total_entries: manifest.total_entries(),
+            total_size: manifest.total_size(),
             entries,
         };
 
@@ -270,8 +270,8 @@ impl<W: Write> OutputFormatter for JsonFormatter<W> {
     fn format_verification_report(&mut self, report: &VerificationReport) -> Result<()> {
         #[derive(Serialize)]
         struct VerificationIssue {
-            severity: String,
-            category: String,
+            severity: &'static str,
+            category: &'static str,
             entry_path: Option<String>,
             message: String,
             context: Option<String>,
@@ -279,22 +279,22 @@ impl<W: Write> OutputFormatter for JsonFormatter<W> {
 
         #[derive(Serialize)]
         struct VerificationOutput {
-            status: String,
-            integrity_status: String,
-            security_status: String,
+            status: &'static str,
+            integrity_status: &'static str,
+            security_status: &'static str,
             total_entries: usize,
             suspicious_entries: usize,
             total_size: u64,
-            format: String,
+            format: &'static str,
             issues: Vec<VerificationIssue>,
         }
 
         let issues = report
-            .issues
+            .issues()
             .iter()
             .map(|i| VerificationIssue {
-                severity: format!("{}", i.severity),
-                category: format!("{}", i.category),
+                severity: i.severity.as_str(),
+                category: i.category.as_str(),
                 entry_path: i.entry_path.as_ref().map(|p| p.display().to_string()),
                 message: i.message.clone(),
                 context: i.context.clone(),
@@ -302,13 +302,13 @@ impl<W: Write> OutputFormatter for JsonFormatter<W> {
             .collect();
 
         let data = VerificationOutput {
-            status: format!("{}", report.status),
-            integrity_status: format!("{}", report.integrity_status),
-            security_status: format!("{}", report.security_status),
-            total_entries: report.total_entries,
-            suspicious_entries: report.suspicious_entries,
-            total_size: report.total_size,
-            format: format!("{:?}", report.format),
+            status: report.status().as_str(),
+            integrity_status: report.integrity_status().as_str(),
+            security_status: report.security_status().as_str(),
+            total_entries: report.total_entries(),
+            suspicious_entries: report.suspicious_entries(),
+            total_size: report.total_size(),
+            format: report.format().as_str(),
             issues,
         };
 
@@ -629,21 +629,11 @@ mod tests {
         use exarch_core::ManifestEntryType;
         use exarch_core::formats::detect::ArchiveType;
 
-        ArchiveManifest {
-            format: ArchiveType::TarGz,
-            total_entries: 1,
-            total_size: 1024,
-            entries: vec![ArchiveEntry {
-                path: PathBuf::from("file.txt"),
-                entry_type: ManifestEntryType::File,
-                size: 1024,
-                compressed_size: None,
-                mode: Some(0o644),
-                modified: None,
-                symlink_target: None,
-                hardlink_target: None,
-            }],
-        }
+        let mut entry = ArchiveEntry::new(PathBuf::from("file.txt"), ManifestEntryType::File, 1024);
+        entry.mode = Some(0o644);
+        let mut manifest = ArchiveManifest::new(ArchiveType::TarGz);
+        manifest.add_entry(entry).unwrap();
+        manifest
     }
 
     #[test]
@@ -668,21 +658,19 @@ mod tests {
 
     #[test]
     fn format_verification_report_writes_full_report() {
-        use exarch_core::CheckStatus;
-        use exarch_core::VerificationStatus;
+        use exarch_core::ArchiveEntry;
+        use exarch_core::ManifestEntryType;
         use exarch_core::formats::detect::ArchiveType;
 
         let mut f = JsonFormatter::with_writer(Vec::new());
-        let report = VerificationReport {
-            status: VerificationStatus::Pass,
-            integrity_status: CheckStatus::Pass,
-            security_status: CheckStatus::Pass,
-            total_entries: 5,
-            suspicious_entries: 0,
-            total_size: 4096,
-            format: ArchiveType::TarGz,
-            issues: vec![],
-        };
+        let mut manifest = ArchiveManifest::new(ArchiveType::TarGz);
+        for i in 0..5 {
+            let path = PathBuf::from(format!("f{i}.txt"));
+            manifest
+                .add_entry(ArchiveEntry::new(path, ManifestEntryType::File, 0))
+                .unwrap();
+        }
+        let report = VerificationReport::from_entry_issues(&manifest, |_| Vec::new());
         f.format_verification_report(&report).unwrap();
         let v = parsed(&f);
         assert_eq!(v["operation"], "verify");

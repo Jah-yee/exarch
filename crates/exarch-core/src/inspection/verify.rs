@@ -10,12 +10,10 @@ use crate::inspection::list::list_archive;
 use crate::inspection::manifest::ArchiveEntry;
 use crate::inspection::manifest::ArchiveManifest;
 use crate::inspection::manifest::ManifestEntryType;
-use crate::inspection::report::CheckStatus;
 use crate::inspection::report::IssueCategory;
 use crate::inspection::report::IssueSeverity;
 use crate::inspection::report::VerificationIssue;
 use crate::inspection::report::VerificationReport;
-use crate::inspection::report::VerificationStatus;
 use crate::security::path::validate_path;
 use crate::security::permissions::sanitize_permissions;
 use crate::security::quota::QuotaTracker;
@@ -33,57 +31,26 @@ pub(crate) fn verify_manifest(
     manifest: &ArchiveManifest,
     config: &SecurityConfig<Validated>,
 ) -> Result<VerificationReport> {
-    let mut issues = Vec::new();
-    let mut suspicious_entries = 0;
-
     let temp_dir = tempfile::TempDir::new()?;
     let temp_dest = DestDir::new(temp_dir.path())?;
 
     let mut quota_tracker = QuotaTracker::new();
 
-    for entry in &manifest.entries {
-        let entry_issues = verify_entry(entry, config, &temp_dest, &mut quota_tracker);
-        let heuristic_issues = check_heuristics(entry);
-
-        // Info/Low heuristics (e.g. suspicious extension) never flip `status`
-        // away from `Pass`, so they historically weren't counted as
-        // "suspicious". A Medium+ heuristic does flip `status`, so it must
-        // count too, or the report becomes self-contradictory (Warning with
-        // zero suspicious entries).
-        let has_medium_plus_heuristic = heuristic_issues
-            .iter()
-            .any(|i| i.severity >= IssueSeverity::Medium);
-        if !entry_issues.is_empty() || has_medium_plus_heuristic {
-            suspicious_entries += 1;
-        }
-
-        issues.extend(entry_issues);
-        issues.extend(heuristic_issues);
-    }
-
-    issues.sort_by(|a, b| a.severity.cmp(&b.severity).reverse());
-
-    let status = determine_status(&issues);
-    let security_status = determine_security_status(&issues);
-
-    Ok(VerificationReport {
-        status,
-        integrity_status: CheckStatus::Pass,
-        security_status,
-        issues,
-        total_entries: manifest.total_entries,
-        suspicious_entries,
-        total_size: manifest.total_size,
-        format: manifest.format,
-    })
+    Ok(VerificationReport::from_entry_issues(manifest, |entry| {
+        let mut issues = verify_entry(entry, config, &temp_dest, &mut quota_tracker);
+        issues.extend(check_heuristics(entry));
+        issues
+    }))
 }
 
-/// Verifies archive integrity and security without extracting.
+/// Verifies archive security without extracting.
 ///
-/// Performs comprehensive validation:
-/// - Integrity checks (structure, checksums)
+/// Performs metadata-only validation:
 /// - Security checks (path traversal, zip bombs, CVEs)
 /// - Policy checks (file types, permissions)
+///
+/// Payload integrity (checksums, decode-to-end) is not verified: the report's
+/// `integrity_status` is [`CheckStatus::Skipped`](crate::CheckStatus::Skipped).
 ///
 /// # Arguments
 ///
@@ -95,8 +62,9 @@ pub(crate) fn verify_manifest(
 /// Returns error if:
 /// - Archive file cannot be opened
 /// - Archive is severely corrupted (cannot read structure)
+/// - Declared compressed sizes exceed the archive length
 ///
-/// Security violations are reported in `VerificationReport.issues`, not as
+/// Security violations are reported in `VerificationReport::issues`, not as
 /// errors.
 ///
 /// # Examples
@@ -110,11 +78,11 @@ pub(crate) fn verify_manifest(
 /// let config = SecurityConfig::default();
 /// let report = verify_archive("archive.tar.gz", &config)?;
 ///
-/// if report.status == VerificationStatus::Pass {
+/// if report.status() == VerificationStatus::Pass {
 ///     println!("Archive is safe to extract");
 /// } else {
 ///     eprintln!("Security issues found:");
-///     for issue in report.issues {
+///     for issue in report.issues() {
 ///         eprintln!("  [{}] {}", issue.severity, issue.message);
 ///     }
 /// }
@@ -298,62 +266,21 @@ fn check_heuristics(entry: &ArchiveEntry) -> Vec<VerificationIssue> {
     issues
 }
 
+const SUSPICIOUS_EXTENSIONS: [&str; 5] = ["exe", "dll", "sh", "bat", "cmd"];
+
 fn is_suspicious_extension(path: &Path) -> bool {
-    matches!(
-        path.extension().and_then(|s| s.to_str()),
-        Some("exe" | "dll" | "sh" | "bat" | "cmd")
-    )
-}
-
-fn determine_status(issues: &[VerificationIssue]) -> VerificationStatus {
-    let has_critical = issues.iter().any(|i| i.severity == IssueSeverity::Critical);
-    let has_high = issues.iter().any(|i| i.severity == IssueSeverity::High);
-    let has_medium = issues.iter().any(|i| i.severity == IssueSeverity::Medium);
-
-    if has_critical || has_high {
-        VerificationStatus::Fail
-    } else if has_medium {
-        VerificationStatus::Warning
-    } else {
-        VerificationStatus::Pass
-    }
-}
-
-fn determine_security_status(issues: &[VerificationIssue]) -> CheckStatus {
-    let security_issues: Vec<_> = issues
-        .iter()
-        .filter(|i| {
-            matches!(
-                i.category,
-                IssueCategory::PathTraversal
-                    | IssueCategory::SymlinkEscape
-                    | IssueCategory::HardlinkEscape
-                    | IssueCategory::ZipBomb
-                    | IssueCategory::InvalidPermissions
-                    | IssueCategory::QuotaExceeded
-            )
-        })
-        .collect();
-
-    if security_issues.is_empty() {
-        CheckStatus::Pass
-    } else {
-        let has_critical = security_issues
+    path.extension().is_some_and(|ext| {
+        SUSPICIOUS_EXTENSIONS
             .iter()
-            .any(|i| i.severity == IssueSeverity::Critical || i.severity == IssueSeverity::High);
-
-        if has_critical {
-            CheckStatus::Fail
-        } else {
-            CheckStatus::Warning
-        }
-    }
+            .any(|s| ext.eq_ignore_ascii_case(s))
+    })
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::inspection::report::VerificationStatus;
     use crate::test_utils::tar_with_pax_nul_path;
     use std::assert_matches;
     use std::io::Write;
@@ -361,53 +288,14 @@ mod tests {
     use tempfile::NamedTempFile;
 
     #[test]
-    fn test_determine_status_pass() {
-        let issues = vec![];
-        assert_eq!(determine_status(&issues), VerificationStatus::Pass);
-    }
-
-    #[test]
-    fn test_determine_status_fail_critical() {
-        let issues = vec![VerificationIssue {
-            severity: IssueSeverity::Critical,
-            category: IssueCategory::PathTraversal,
-            entry_path: None,
-            message: "Test".to_string(),
-            context: None,
-        }];
-        assert_eq!(determine_status(&issues), VerificationStatus::Fail);
-    }
-
-    #[test]
-    fn test_determine_status_fail_high() {
-        let issues = vec![VerificationIssue {
-            severity: IssueSeverity::High,
-            category: IssueCategory::QuotaExceeded,
-            entry_path: None,
-            message: "Test".to_string(),
-            context: None,
-        }];
-        assert_eq!(determine_status(&issues), VerificationStatus::Fail);
-    }
-
-    #[test]
-    fn test_determine_status_warning() {
-        let issues = vec![VerificationIssue {
-            severity: IssueSeverity::Medium,
-            category: IssueCategory::InvalidPermissions,
-            entry_path: None,
-            message: "Test".to_string(),
-            context: None,
-        }];
-        assert_eq!(determine_status(&issues), VerificationStatus::Warning);
-    }
-
-    #[test]
     fn test_is_suspicious_extension() {
         assert!(is_suspicious_extension(Path::new("file.exe")));
         assert!(is_suspicious_extension(Path::new("file.dll")));
         assert!(is_suspicious_extension(Path::new("file.sh")));
         assert!(is_suspicious_extension(Path::new("file.bat")));
+        assert!(is_suspicious_extension(Path::new("FILE.EXE")));
+        assert!(is_suspicious_extension(Path::new("run.Bat")));
+        assert!(is_suspicious_extension(Path::new("x.CMD")));
         assert!(!is_suspicious_extension(Path::new("file.txt")));
         assert!(!is_suspicious_extension(Path::new("file.rs")));
     }
@@ -523,14 +411,14 @@ mod tests {
         let report = verify_archive(temp_file.path(), &config).unwrap();
 
         assert_eq!(
-            report.status,
+            report.status(),
             VerificationStatus::Pass,
             "Safe archive should pass verification"
         );
-        assert_eq!(report.total_entries, 1);
-        assert_eq!(report.suspicious_entries, 0);
+        assert_eq!(report.total_entries(), 1);
+        assert_eq!(report.suspicious_entries(), 0);
         assert!(
-            report.issues.is_empty(),
+            report.issues().is_empty(),
             "Safe archive should have no issues"
         );
     }
@@ -563,19 +451,19 @@ mod tests {
             .expect("verify_archive must report oversized entries, not error out");
 
         assert_eq!(
-            report.status,
+            report.status(),
             VerificationStatus::Fail,
             "oversized entry must fail verification via a report, not a hard error"
         );
-        assert_eq!(report.suspicious_entries, 1);
+        assert_eq!(report.suspicious_entries(), 1);
         assert!(
-            report.issues.iter().any(|i| {
+            report.issues().iter().any(|i| {
                 i.severity == IssueSeverity::High
                     && i.category == IssueCategory::QuotaExceeded
                     && i.message.contains("single file size")
             }),
             "expected a High-severity QuotaExceeded FileSize issue, got: {:?}",
-            report.issues
+            report.issues()
         );
     }
 
@@ -625,18 +513,18 @@ mod tests {
             .expect("verify_archive must report a NUL-byte entry path, not error out");
 
         assert_eq!(
-            report.status,
+            report.status(),
             VerificationStatus::Fail,
             "NUL-byte entry path must fail verification via a report, not a hard error"
         );
-        assert_eq!(report.suspicious_entries, 1);
+        assert_eq!(report.suspicious_entries(), 1);
         assert!(
             report
-                .issues
+                .issues()
                 .iter()
                 .any(|i| i.message.contains("null bytes")),
             "expected an issue mentioning null bytes, got: {:?}",
-            report.issues
+            report.issues()
         );
     }
 
@@ -667,21 +555,22 @@ mod tests {
             .expect("verify_archive must report a non-UTF8 entry name, not error out");
 
         assert_eq!(
-            report.status,
+            report.status(),
             VerificationStatus::Warning,
             "non-UTF8 entry name must surface as a Warning, not silently Pass"
         );
         assert_eq!(
-            report.suspicious_entries, 1,
+            report.suspicious_entries(),
+            1,
             "a Medium+ heuristic issue must be reflected in suspicious_entries, \
              or the report is self-contradictory (Warning with 0 suspicious entries)"
         );
         assert!(
-            report.issues.iter().any(|i| {
+            report.issues().iter().any(|i| {
                 i.category == IssueCategory::SuspiciousPath && i.message.contains("not valid UTF-8")
             }),
             "expected a SuspiciousPath issue mentioning UTF-8, got: {:?}",
-            report.issues
+            report.issues()
         );
     }
 
@@ -716,20 +605,20 @@ mod tests {
             .expect("verify_archive must report a missing hardlink target, not error out");
 
         assert_eq!(
-            report.status,
+            report.status(),
             VerificationStatus::Fail,
             "missing hardlink target must fail verification via a report, not a hard error"
         );
-        assert_eq!(report.suspicious_entries, 1);
+        assert_eq!(report.suspicious_entries(), 1);
         assert!(
-            report.issues.iter().any(|i| {
+            report.issues().iter().any(|i| {
                 i.category == IssueCategory::HardlinkEscape
                     && i.context
                         .as_deref()
                         .is_some_and(|c| c.contains("empty path not allowed"))
             }),
             "expected a HardlinkEscape issue citing the empty target, got: {:?}",
-            report.issues
+            report.issues()
         );
     }
 
@@ -763,24 +652,24 @@ mod tests {
         let report = verify_archive(temp_file.path(), &config).unwrap();
 
         assert_eq!(
-            report.status,
+            report.status(),
             VerificationStatus::Fail,
             "Symlink should fail verification with default config"
         );
-        assert_eq!(report.total_entries, 1);
-        assert_eq!(report.suspicious_entries, 1);
-        assert!(!report.issues.is_empty(), "Should detect symlink");
+        assert_eq!(report.total_entries(), 1);
+        assert_eq!(report.suspicious_entries(), 1);
+        assert!(!report.issues().is_empty(), "Should detect symlink");
 
         // Symlink is blocked by default config (SecurityViolation ->
         // SuspiciousPath category)
-        let has_symlink_issue = report.issues.iter().any(|i| {
+        let has_symlink_issue = report.issues().iter().any(|i| {
             matches!(i.category, IssueCategory::SuspiciousPath) && i.message.contains("symlink")
         });
 
         assert!(
             has_symlink_issue,
             "Should have symlink-related issue, got: {:?}",
-            report.issues
+            report.issues()
         );
     }
 
@@ -805,12 +694,12 @@ mod tests {
         let report = verify_archive(temp_file.path(), &config).unwrap();
 
         assert!(
-            !report.issues.is_empty(),
+            !report.issues().is_empty(),
             "Should detect setuid permission issue"
         );
         assert!(
             report
-                .issues
+                .issues()
                 .iter()
                 .any(|i| i.category == IssueCategory::InvalidPermissions),
             "Should have InvalidPermissions issue for setuid"
@@ -837,23 +726,24 @@ mod tests {
         let config = SecurityConfig::default();
         let report = verify_archive(temp_file.path(), &config).unwrap();
 
-        assert!(!report.issues.is_empty(), "Should detect executable file");
+        assert!(!report.issues().is_empty(), "Should detect executable file");
         assert!(
             report
-                .issues
+                .issues()
                 .iter()
                 .any(|i| i.category == IssueCategory::ExecutableFile),
             "Should have ExecutableFile issue"
         );
         assert!(
             report
-                .issues
+                .issues()
                 .iter()
                 .any(|i| i.category == IssueCategory::SuspiciousPath),
             "Should have SuspiciousPath issue for .sh extension"
         );
         assert_eq!(
-            report.suspicious_entries, 0,
+            report.suspicious_entries(),
+            0,
             "Info/Low-severity heuristic issues (executable, suspicious extension) must not \
              count toward suspicious_entries — only Medium+ issues do"
         );
