@@ -213,6 +213,9 @@ pub enum IssueCategory {
     /// Quota exceeded (file count or size).
     #[napi(value = "Quota Exceeded")]
     QuotaExceeded,
+    /// Entry rejected by the security policy.
+    #[napi(value = "Security Policy")]
+    SecurityPolicy,
     /// Invalid or corrupted archive.
     #[napi(value = "Invalid Archive")]
     InvalidArchive,
@@ -235,6 +238,7 @@ impl TryFrom<CoreIssueCategory> for IssueCategory {
             CoreIssueCategory::ZipBomb => Self::ZipBomb,
             CoreIssueCategory::InvalidPermissions => Self::InvalidPermissions,
             CoreIssueCategory::QuotaExceeded => Self::QuotaExceeded,
+            CoreIssueCategory::SecurityPolicy => Self::SecurityPolicy,
             CoreIssueCategory::InvalidArchive => Self::InvalidArchive,
             CoreIssueCategory::SuspiciousPath => Self::SuspiciousPath,
             CoreIssueCategory::ExecutableFile => Self::ExecutableFile,
@@ -373,7 +377,7 @@ pub struct ArchiveEntry {
     pub entry_type: ManifestEntryType,
     /// Uncompressed size in bytes (0 for directories).
     pub size: i64,
-    /// Compressed size in bytes (if available, ZIP only).
+    /// Compressed size in bytes (if the format reports one).
     pub compressed_size: Option<i64>,
     /// File permissions (Unix mode).
     pub mode: Option<u32>,
@@ -390,9 +394,9 @@ impl From<exarch_core::inspection::ArchiveEntry> for ArchiveEntry {
     fn from(entry: exarch_core::inspection::ArchiveEntry) -> Self {
         Self {
             path: entry.path.to_string_lossy().into_owned(),
-            entry_type: entry.entry_type.into(),
+            entry_type: entry.kind.entry_type().into(),
             size: saturating_i64(entry.size),
-            compressed_size: entry.compressed_size.map(saturating_i64),
+            compressed_size: entry.compressed_size().map(saturating_i64),
             mode: entry.mode,
             modified: entry.modified.and_then(|t| {
                 t.duration_since(std::time::UNIX_EPOCH)
@@ -400,10 +404,12 @@ impl From<exarch_core::inspection::ArchiveEntry> for ArchiveEntry {
                     .map(|d| d.as_millis().min(i64::MAX as u128) as i64)
             }),
             symlink_target: entry
-                .symlink_target
+                .kind
+                .symlink_target()
                 .map(|p| p.to_string_lossy().into_owned()),
             hardlink_target: entry
-                .hardlink_target
+                .kind
+                .hardlink_target()
                 .map(|p| p.to_string_lossy().into_owned()),
         }
     }
@@ -653,7 +659,7 @@ mod tests {
     fn sized_entry(name: &str, size: u64) -> exarch_core::inspection::ArchiveEntry {
         exarch_core::inspection::ArchiveEntry::new(
             std::path::PathBuf::from(name),
-            exarch_core::inspection::ManifestEntryType::File,
+            exarch_core::inspection::ManifestEntryKind::File,
             size,
         )
     }
@@ -666,10 +672,10 @@ mod tests {
 
         let mut core_entry = exarch_core::inspection::ArchiveEntry::new(
             PathBuf::from("test/file.txt"),
-            exarch_core::inspection::ManifestEntryType::File,
+            exarch_core::inspection::ManifestEntryKind::File,
             1024,
         );
-        core_entry.compressed_size = Some(512);
+        core_entry.compression = exarch_core::EntryCompression::Entry(512);
         core_entry.mode = Some(0o644);
         core_entry.modified = Some(UNIX_EPOCH + std::time::Duration::from_secs(1000));
 
@@ -726,6 +732,39 @@ mod tests {
         assert_eq!(report.total_entries, 10);
         assert_eq!(report.suspicious_entries, 0);
         assert_eq!(report.total_size, 5000);
+    }
+
+    #[test]
+    fn test_security_policy_issue_conversion_and_status() {
+        let core_issue = exarch_core::inspection::VerificationIssue::new(
+            CoreIssueSeverity::High,
+            CoreIssueCategory::SecurityPolicy,
+            "Security violation: symlinks not allowed".to_string(),
+        );
+
+        let issue = VerificationIssue::try_from(core_issue).unwrap();
+        assert_eq!(issue.category, IssueCategory::SecurityPolicy);
+
+        let mut manifest = exarch_core::inspection::ArchiveManifest::new(
+            exarch_core::formats::detect::ArchiveType::Tar,
+        );
+        manifest
+            .add_entry(exarch_core::inspection::ArchiveEntry::new(
+                std::path::PathBuf::from("link"),
+                exarch_core::inspection::ManifestEntryKind::File,
+                0,
+            ))
+            .unwrap();
+        let core_report =
+            exarch_core::inspection::VerificationReport::from_entry_issues(&manifest, |_| {
+                vec![exarch_core::inspection::VerificationIssue::new(
+                    CoreIssueSeverity::High,
+                    CoreIssueCategory::SecurityPolicy,
+                    "Security violation: symlinks not allowed".to_string(),
+                )]
+            });
+        let report = VerificationReport::try_from(core_report).unwrap();
+        assert_eq!(report.security_status, CheckStatus::Fail);
     }
 
     // VerificationIssue tests
@@ -883,7 +922,7 @@ mod tests {
     #[test]
     fn test_archive_entry_saturates_compressed_size_at_i64_max() {
         let mut core_entry = sized_entry("test.txt", 1024);
-        core_entry.compressed_size = Some(u64::MAX);
+        core_entry.compression = exarch_core::EntryCompression::Entry(u64::MAX);
 
         let entry = ArchiveEntry::from(core_entry);
 
@@ -947,5 +986,45 @@ mod tests {
                 .map(|v| ManifestEntryType::from(*v))
                 .collect::<Vec<_>>(),
         );
+    }
+
+    fn union_line<T: Copy>(name: &str, all: &[T], as_str: fn(T) -> &'static str) -> String {
+        let values: Vec<String> = all.iter().map(|v| format!("'{}'", as_str(*v))).collect();
+        format!("export type {name} = {}", values.join(" | "))
+    }
+
+    #[test]
+    fn test_index_d_ts_unions_match_core_enums() {
+        let dts = include_str!("../index.d.ts");
+        let expected = [
+            union_line("ArchiveType", CoreArchiveType::ALL, CoreArchiveType::as_str),
+            union_line(
+                "IssueCategory",
+                CoreIssueCategory::ALL,
+                CoreIssueCategory::as_str,
+            ),
+            union_line(
+                "IssueSeverity",
+                CoreIssueSeverity::ALL,
+                CoreIssueSeverity::as_str,
+            ),
+            union_line("CheckStatus", CoreCheckStatus::ALL, CoreCheckStatus::as_str),
+            union_line(
+                "ManifestEntryType",
+                CoreManifestEntryType::ALL,
+                CoreManifestEntryType::as_str,
+            ),
+            union_line(
+                "VerificationStatus",
+                CoreVerificationStatus::ALL,
+                CoreVerificationStatus::as_str,
+            ),
+        ];
+        for line in expected {
+            assert!(
+                dts.lines().any(|l| l == line),
+                "index.d.ts out of sync with exarch-core, expected line:\n{line}"
+            );
+        }
     }
 }

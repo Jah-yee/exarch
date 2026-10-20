@@ -316,7 +316,7 @@ fn extract_tar(
     use crate::formats::tar::open_tar_stream;
     use crate::formats::traits::ArchiveFormat;
 
-    let stream = open_tar_stream(archive_path, codec)?;
+    let stream = open_tar_stream(archive_path, codec, config.max_decoder_memory)?;
     let mut archive = TarArchive::new(stream);
     archive.extract(output_dir, config, options, progress)
 }
@@ -468,14 +468,10 @@ pub fn create_archive_with_progress<P: AsRef<Path>, Q: AsRef<Path>>(
 fn creator_for_format(
     format: ArchiveType,
 ) -> Result<Box<dyn crate::formats::traits::FormatCreator>> {
-    match format {
-        ArchiveType::Tar => Ok(Box::new(crate::creation::TarCreator)),
-        ArchiveType::TarGz => Ok(Box::new(crate::creation::TarGzCreator)),
-        ArchiveType::TarBz2 => Ok(Box::new(crate::creation::TarBz2Creator)),
-        ArchiveType::TarXz => Ok(Box::new(crate::creation::TarXzCreator)),
-        ArchiveType::TarZst => Ok(Box::new(crate::creation::TarZstCreator)),
-        ArchiveType::Zip => Ok(Box::new(crate::creation::ZipCreator)),
-        ArchiveType::SevenZ => Err(ArchiveError::InvalidConfiguration {
+    match format.family() {
+        FormatFamily::Tar(codec) => Ok(Box::new(crate::creation::TarCreator(codec))),
+        FormatFamily::Zip => Ok(Box::new(crate::creation::ZipCreator)),
+        FormatFamily::SevenZ => Err(ArchiveError::InvalidConfiguration {
             reason: "7z archive creation is not supported".into(),
         }),
     }
@@ -543,9 +539,14 @@ pub fn list_archive<P: AsRef<Path>>(
 /// - Archive file cannot be opened
 /// - Archive is severely corrupted (cannot read structure)
 /// - Declared compressed sizes exceed the archive length
+/// - An entry name is a path traversal (`..` component, or an absolute path
+///   unless `allowed.absolute_paths` is set): the listing step rejects it with
+///   [`ArchiveError::PathTraversal`] before a report exists
 ///
-/// Security violations are reported in `VerificationReport::issues`,
-/// not as errors.
+/// Other security violations are reported in `VerificationReport::issues`
+/// instead: disallowed links, link targets that escape the destination,
+/// quota and compression-ratio violations, NUL bytes, banned components and
+/// unsafe permissions.
 ///
 /// # Examples
 ///

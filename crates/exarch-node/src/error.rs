@@ -23,7 +23,10 @@ use napi::bindgen_prelude::*;
 /// - `UNSUPPORTED_FORMAT`: Archive format not supported
 /// - `INVALID_ARCHIVE`: Archive is corrupted
 /// - `IO_ERROR`: I/O operation failed
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one cohesive sequence; splitting it would obscure the order of checks"
+)]
 pub fn convert_error(err: CoreError) -> Error {
     use std::fmt::Write;
     match err {
@@ -96,6 +99,12 @@ pub fn convert_error(err: CoreError) -> Error {
                 CoreQuotaResource::IntegerOverflow => {
                     msg.push_str(
                         "QUOTA_EXCEEDED: quota exceeded: integer overflow in quota tracking",
+                    );
+                }
+                CoreQuotaResource::DecoderMemory { max } => {
+                    let _ = write!(
+                        &mut msg,
+                        "QUOTA_EXCEEDED: quota exceeded: decoder memory (> {max} bytes)"
                     );
                 }
                 // Forward-compat: a variant added to QuotaResource after this

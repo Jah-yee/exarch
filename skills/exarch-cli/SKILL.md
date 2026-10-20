@@ -100,12 +100,12 @@ Key flags (all optional):
 | `--max-files` | 10000 | Max number of entries to extract. |
 | `--max-total-size` | 500 MB | Max cumulative extracted size. Accepts `K`/`M`/`G`/`T` suffixes, e.g. `2G`. |
 | `--max-file-size` | 50 MB | Max size of any single extracted file. Same suffix syntax. |
-| `--max-compression-ratio` | 100 | Max uncompressed/compressed ratio before an entry is treated as a zip bomb. |
+| `--max-compression-ratio` | 100 | Max uncompressed/compressed ratio before an entry is treated as a zip bomb. Applies to ZIP and non-solid 7z; it does **not** apply to solid 7z blocks. With `--allow-solid-archives`, each solid block is checked as a whole against a fixed 1000x limit (`max_solid_compression_ratio`, Rust API only, not configurable from the CLI). |
 | `--max-path-depth` | 32 | Max path component depth allowed per entry. |
 | `--allowed-extensions <EXT>` | all allowed | Restrict extraction to matching extensions. Repeatable or comma-separated (`txt,pdf`); leading dot optional, case-insensitive. |
 | `--allow-symlinks` | off | Allow symlinks that resolve within the extraction directory. |
 | `--allow-hardlinks` | off | Allow hardlinks that resolve within the extraction directory. |
-| `--allow-absolute-paths` | off | Allow archive entries with absolute paths. |
+| `--allow-absolute-paths` | off | Allow archive entries with absolute paths. For ZIP the leading root or drive prefix is stripped, so the entry lands under the destination (`/tmp/x` extracts to `<dest>/tmp/x`). |
 | `--allow-world-writable` | off | Allow files with world-writable (mode `0o002`) permission bits. |
 | `--allow-solid-archives` | off | Allow solid 7z archives (see Security model below). |
 | `--banned-component <COMPONENT>` | see below | Block entries whose path contains this component. **Replaces** the default list — see warning below. Repeatable. |
@@ -200,6 +200,20 @@ document to stdout — a `status: "success"` envelope carrying the full report (
 "FAIL"`, findings in `data.issues`). Verified live on an archive containing a bare symlink
 entry: a single valid JSON document, parseable with a plain `json.loads(stdout)`. The process
 still exits `1` for a FAIL status.
+
+`data.issues[].category` is one of `"Path Traversal"`, `"Symlink Escape"`, `"Hardlink Escape"`,
+`"Zip Bomb"`, `"Invalid Permissions"`, `"Quota Exceeded"`, `"Security Policy"`,
+`"Invalid Archive"`, `"Suspicious Path"`, `"Executable File"`. `"Security Policy"` covers entries
+rejected by the configured policy rather than by an attack check: a symlink or hardlink under the
+default config (`Security violation: symlinks not allowed` / `hardlinks not allowed`), NUL bytes,
+banned components. These are security findings: `security_status` is `FAILED` (`Security:
+FAILED` in text mode), not `OK`. Verified live with the debug binary on a TAR containing a
+symlink and on one containing a hardlink: each gives `status: FAIL`, `Security: FAILED`, one
+`HIGH` `"Security Policy"` issue, exit code `1`.
+Consequently `exarch verify` exits `1` with `Security: FAILED` for **any** TAR containing a hardlink or
+symlink: `verify` always applies the default policy (links not allowed) and has no
+`--allow-hardlinks` / `--allow-symlinks` flags, so such an archive cannot be verified as passing
+even if you intend to extract it with those flags.
 
 ### `completion <SHELL>`
 
@@ -374,7 +388,23 @@ across versions.
 
 Default `SecurityConfig` limits: 50 MB per file, 500 MB total extracted size, 100x max
 compression ratio, 10,000 max files, 32 max path depth. All symlinks, hardlinks, absolute
-paths, and world-writable files are rejected unless explicitly allowed. setuid/setgid bits are
+paths, and world-writable files are rejected unless explicitly allowed. This holds for ZIP too: an
+absolute entry name or any `..` component in the raw name is
+`PathTraversal` by default. A name is absolute on every platform when it starts with `/` or `\`
+(UNC included), or with a drive letter followed by a separator or nothing (`C:\x`, `C:/x`, `C:`);
+a drive glued to a name (`C:name`) is absolute only on Windows, and on Unix `a:notes.txt` is kept
+as is. An empty entry name is `InvalidArchive`, and a NUL byte in an entry name is
+`SecurityViolation`. On Windows only, entries
+whose path has a reserved device-name component (`CON`, `NUL`, `COM1`, ... ASCII
+case-insensitive, with or without an extension, e.g. `NUL.tar.gz`) or a component containing
+`:` (NTFS alternate data streams) are rejected with `SecurityViolation`; there is no CLI flag to
+disable this (the opt-out exists only in the Rust API). On other platforms these names are
+accepted. A `.tar.xz` whose LZMA2 dictionary needs more than the decoder-memory limit (default
+256 MiB; `SecurityConfig::max_decoder_memory` in the Rust API, 1 GiB under `permissive()`) is
+rejected by `extract`, `list` and `verify` with `QuotaExceeded` (`quota exceeded: decoder memory
+(> 268435456 bytes)`); there is no CLI flag to raise it. Only xz is bounded this way; zstd keeps
+its fixed decoder window. Verified live: an archive built with `xz --lzma2=dict=300MiB` (needs
+385 MiB) fails `extract` and `list` with exit code `1`, `error.kind: "QuotaExceeded"` in `--json`. setuid/setgid bits are
 always stripped on Unix regardless of `--preserve-permissions`. Solid 7z archives (multiple
 files compressed as one block) are rejected by default because extracting even one file
 requires decompressing the whole block into memory — a memory-exhaustion vector; enable

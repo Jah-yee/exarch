@@ -134,6 +134,7 @@ use crate::Result;
 use crate::SecurityConfig;
 use crate::config::Validated;
 use crate::copy::CopyBuffer;
+use crate::copy::declared_size_exceeded;
 use crate::security::EntryValidator;
 use crate::security::permissions::SanitizedMode;
 use crate::security::quota::QuotaPermit;
@@ -162,7 +163,6 @@ struct ZipExtractionContext<'a> {
     report: &'a mut ExtractionReport,
     copy_buffer: &'a mut CopyBuffer,
     dir_cache: &'a mut common::DirCache,
-    compressed_budget: &'a mut DeclaredCompressedBudget,
     skip_duplicates: bool,
     /// Count of file/symlink entries skipped as pre-existing duplicates,
     /// threaded through `common::extract_file_with_permit` and
@@ -176,6 +176,115 @@ struct ZipExtractionContext<'a> {
     /// per entry (issue #495).
     disallowed_extension_skips: &'a mut u64,
     progress: &'a mut dyn ProgressCallback,
+}
+
+/// How a raw ZIP entry name starts, as far as absolute-path policy cares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NamePrefix {
+    /// Starts with `/` or `\` (including UNC `\\server\share`), or a drive
+    /// followed by a separator or nothing (`C:\x`, `C:/x`, `C:`)
+    Rooted,
+    /// A drive letter glued to a name (`C:x`): drive-relative on Windows, an
+    /// ordinary file name elsewhere
+    DriveRelative,
+    /// Anything else
+    Plain,
+}
+
+fn classify_name_prefix(raw: &str) -> NamePrefix {
+    let bytes = raw.as_bytes();
+    if raw.starts_with(['/', '\\']) {
+        return NamePrefix::Rooted;
+    }
+    match (bytes.first(), bytes.get(1), bytes.get(2)) {
+        (Some(drive), Some(b':'), None | Some(b'/' | b'\\')) if drive.is_ascii_alphabetic() => {
+            NamePrefix::Rooted
+        }
+        (Some(drive), Some(b':'), Some(_)) if drive.is_ascii_alphabetic() => {
+            NamePrefix::DriveRelative
+        }
+        _ => NamePrefix::Plain,
+    }
+}
+
+/// Applies the entry-path policy shared by ZIP extraction and listing.
+///
+/// `raw` is the entry name as stored; `enclosed` is `ZipFile::enclosed_name()`,
+/// which silently drops a leading root or drive prefix and so cannot be used
+/// alone to enforce the absolute-path policy.
+///
+/// # Errors
+///
+/// - `SecurityViolation` for a NUL byte (unless the verify preflight config is
+///   relaxed, in which case the raw name is returned for verify to report)
+/// - `InvalidArchive` for an empty name
+/// - `PathTraversal` for an absolute name without `allow_absolute_paths`, for
+///   any `..` component (split on both `/` and `\`), for an absolute name that
+///   resolves to nothing, and when `enclosed` is `None`
+///
+/// A name is absolute when it starts with `/` or `\`, or with a drive plus a
+/// separator or nothing (`C:\x`, `C:/x`, `C:`), on every platform. A drive
+/// glued to a name (`C:x`) is absolute only on Windows; elsewhere it is an
+/// ordinary file name and is kept as stored.
+pub(crate) fn resolve_zip_entry_path(
+    raw: &str,
+    enclosed: Option<PathBuf>,
+    config: &SecurityConfig<Validated>,
+) -> Result<PathBuf> {
+    let traversal = || ArchiveError::PathTraversal {
+        path: PathBuf::from(raw),
+    };
+
+    if raw.contains('\0') {
+        if config.relaxed_for_verify_preflight {
+            return Ok(PathBuf::from(raw));
+        }
+        return Err(ArchiveError::SecurityViolation {
+            reason: format!("path contains null bytes: {}", raw.escape_debug()),
+        });
+    }
+
+    if raw.is_empty() {
+        return Err(ArchiveError::InvalidArchive("empty ZIP entry name".into()));
+    }
+
+    let prefix = classify_name_prefix(raw);
+    let absolute =
+        prefix == NamePrefix::Rooted || (prefix == NamePrefix::DriveRelative && cfg!(windows));
+    if absolute && !config.allowed.absolute_paths {
+        return Err(traversal());
+    }
+    if raw.split(['/', '\\']).any(|component| component == "..") {
+        return Err(traversal());
+    }
+
+    // `enclosed_name()` parses Windows syntax on every platform and would
+    // strip `a:` from the ordinary Unix file name `a:notes.txt`.
+    if prefix == NamePrefix::DriveRelative && !absolute {
+        return Ok(raw
+            .split(['/', '\\'])
+            .filter(|component| !component.is_empty() && *component != ".")
+            .collect());
+    }
+
+    match enclosed {
+        Some(path) if absolute && path.as_os_str().is_empty() => Err(traversal()),
+        Some(path) => Ok(path),
+        None => Err(traversal()),
+    }
+}
+
+/// Whether opening a ZIP entry failed because it is encrypted.
+///
+/// Matches the typed upstream variants so an upstream message change cannot
+/// silently reclassify encrypted archives as merely invalid.
+pub(crate) fn is_password_required(error: &zip::result::ZipError) -> bool {
+    use zip::result::ZipError;
+
+    matches!(
+        error,
+        ZipError::UnsupportedArchive(ZipError::PASSWORD_REQUIRED) | ZipError::InvalidPassword
+    )
 }
 
 /// Appends aggregated duplicate-skip and disallowed-extension warnings to
@@ -268,80 +377,46 @@ impl<R: Read + Seek> ZipArchive<R> {
 
         // Detect password protection early (CRIT-003: robust check with entry
         // limit)
-        if Self::is_password_protected(&mut inner)? {
-            return Err(ArchiveError::SecurityViolation {
-                reason: "password-protected ZIP archives are not supported".into(),
-            });
-        }
+        Self::scan_entries(&mut inner)?;
 
         Ok(Self { inner })
     }
 
-    /// Checks if any entry in the archive is encrypted.
+    /// Rejects encrypted entries and declared compressed sizes that do not fit
+    /// in the archive, before any caller can write a byte.
     ///
-    /// Scans all entries via metadata-only reads (no decompression). Stops
-    /// early on the first encrypted entry found.
-    fn is_password_protected(archive: &mut ZipReader<R>) -> Result<bool> {
-        for i in 0..archive.len() {
-            if Self::check_entry_encrypted(archive, i)? {
-                return Ok(true);
+    /// Opens every entry via metadata-only reads (no decompression), so a
+    /// corrupt local header also fails here. Shared by extraction and listing
+    /// because both go through [`ZipArchive::new`].
+    fn scan_entries(archive: &mut ZipReader<R>) -> Result<()> {
+        let mut budget = DeclaredCompressedBudget::new(archive.central_directory_start());
+        for index in 0..archive.len() {
+            match archive.by_index(index) {
+                Ok(file) if file.encrypted() => return Err(common::encrypted_archive_error()),
+                Ok(file) => budget.charge(file.compressed_size())?,
+                Err(e) if is_password_required(&e) => {
+                    return Err(common::encrypted_archive_error());
+                }
+                Err(e) => {
+                    return Err(ArchiveError::InvalidArchive(format!(
+                        "failed to read entry {index}: {e}"
+                    )));
+                }
             }
         }
-        Ok(false)
+        Ok(())
     }
 
-    #[inline]
-    fn check_entry_encrypted(archive: &mut ZipReader<R>, index: usize) -> Result<bool> {
-        match archive.by_index(index) {
-            Ok(file) => Ok(file.encrypted()),
-            Err(e) if e.to_string().contains("Password required to decrypt file") => Ok(true),
-            Err(e) => Err(ArchiveError::InvalidArchive(format!(
-                "failed to check entry {index} for encryption: {e}"
-            ))),
-        }
-    }
-
-    /// Resolves the entry path from a ZIP file, applying absolute-path policy.
-    ///
-    /// Returns `Err(PathTraversal)` for any path that escapes the archive root,
-    /// and strips a leading `/` when `allow_absolute_paths` is enabled.
+    /// Resolves the entry path from a ZIP file via [`resolve_zip_entry_path`].
     fn resolve_entry_path(
         zip_file: &zip::read::ZipFile<'_, R>,
         index: usize,
-        allow_absolute_paths: bool,
+        config: &SecurityConfig<Validated>,
     ) -> Result<PathBuf> {
-        let raw_name = zip_file
-            .name()
-            .map_err(|e| {
-                ArchiveError::InvalidArchive(format!("invalid entry name at {index}: {e}"))
-            })?
-            .into_owned();
-        match zip_file.enclosed_name() {
-            Some(p) => Ok(p),
-            None if allow_absolute_paths => {
-                let stripped = raw_name.trim_start_matches('/');
-                if stripped.is_empty() {
-                    return Err(ArchiveError::PathTraversal {
-                        path: PathBuf::from(&raw_name),
-                    });
-                }
-                let p = PathBuf::from(stripped);
-                // SafePath::validate will enforce the remaining security
-                // checks; we only need to pre-reject clear
-                // traversal here.
-                if p.components()
-                    .any(|c| matches!(c, std::path::Component::ParentDir))
-                {
-                    return Err(ArchiveError::PathTraversal {
-                        path: PathBuf::from(&raw_name),
-                    });
-                }
-                Ok(p)
-            }
-            None => Err(ArchiveError::PathTraversal {
-                path: PathBuf::from(&raw_name),
-            }),
-        }
+        let raw_name = zip_file.name().map_err(|e| {
+            ArchiveError::InvalidArchive(format!("invalid entry name at {index}: {e}"))
+        })?;
+        resolve_zip_entry_path(&raw_name, zip_file.enclosed_name(), config)
     }
 
     /// Processes a single ZIP entry using an already-opened `ZipFile`.
@@ -367,10 +442,9 @@ impl<R: Read + Seek> ZipArchive<R> {
             });
         }
 
-        let path = Self::resolve_entry_path(&zip_file, index, ctx.config.allowed.absolute_paths)?;
+        let path = Self::resolve_entry_path(&zip_file, index, ctx.config)?;
 
         let (uncompressed_size, compressed_size) = ZipEntryAdapter::get_sizes(&zip_file);
-        ctx.compressed_budget.charge(compressed_size)?;
         let mode = zip_file.unix_mode();
 
         let compression = ZipEntryAdapter::get_compression_method(&zip_file);
@@ -494,12 +568,7 @@ impl<R: Read + Seek> ZipArchive<R> {
                 if io.kind() == std::io::ErrorKind::InvalidData
                     && io.to_string() == ZIP_DECLARED_SIZE_EXCEEDED =>
             {
-                ArchiveError::SecurityViolation {
-                    reason: format!(
-                        "decompressed size exceeded the declared uncompressed size of \
-                         {declared} bytes"
-                    ),
-                }
+                declared_size_exceeded(declared)
             }
             other => other,
         }
@@ -530,9 +599,6 @@ impl<R: Read + Seek> ArchiveFormat for ZipArchive<R> {
 
         let mut dir_cache = common::DirCache::new();
 
-        let mut compressed_budget =
-            DeclaredCompressedBudget::new(self.inner.central_directory_start());
-
         // Aggregated into a single warning after extraction instead of one
         // per skipped entry, mirroring 7z's `duplicate_skips` accumulator
         // (issue #490).
@@ -548,10 +614,8 @@ impl<R: Read + Seek> ArchiveFormat for ZipArchive<R> {
             let zip_file = match self.inner.by_index(i) {
                 Ok(f) => f,
                 Err(e) => {
-                    let err = if e.to_string().contains("Password required to decrypt file") {
-                        ArchiveError::SecurityViolation {
-                            reason: "archive is password-protected.\n  Password-protected ZIP archives are not supported. Decrypt the archive externally and try again.".into(),
-                        }
+                    let err = if is_password_required(&e) {
+                        common::encrypted_archive_error()
                     } else {
                         ArchiveError::InvalidArchive(format!("failed to open zip entry {i}: {e}"))
                     };
@@ -585,7 +649,6 @@ impl<R: Read + Seek> ArchiveFormat for ZipArchive<R> {
                 report: &mut report,
                 copy_buffer: &mut copy_buffer,
                 dir_cache: &mut dir_cache,
-                compressed_budget: &mut compressed_budget,
                 skip_duplicates,
                 duplicate_skips: &mut duplicate_skips,
                 disallowed_extension_skips: &mut disallowed_extension_skips,
@@ -1067,16 +1130,34 @@ mod tests {
     }
 
     #[test]
-    fn test_absolute_path_sanitized_by_zip_crate() {
-        // zip 8.x enclosed_name() strips the leading `/` from simple absolute
-        // paths like `/etc/shadow`, returning Some("etc/shadow"). Extraction
-        // must write to <dest>/etc/shadow, never to the real /etc/shadow.
+    fn test_absolute_path_rejected_by_default() {
         let zip_data = create_test_zip(vec![("/etc/shadow", b"content")]);
-        let cursor = Cursor::new(zip_data);
-        let mut archive = ZipArchive::new(cursor).unwrap();
+        let mut archive = ZipArchive::new(Cursor::new(zip_data)).unwrap();
 
         let temp = TempDir::new().unwrap();
         let config = SecurityConfig::default().validate().expect("valid config");
+
+        let result = archive.extract(
+            temp.path(),
+            &config,
+            &ExtractionOptions::default(),
+            &mut crate::NoopProgress,
+        );
+
+        assert_matches!(result, Err(ArchiveError::PathTraversal { .. }));
+        assert!(!temp.path().join("etc/shadow").exists());
+    }
+
+    #[test]
+    fn test_absolute_path_relocated_only_with_allow_absolute_paths() {
+        let zip_data = create_test_zip(vec![("/etc/shadow", b"content")]);
+        let mut archive = ZipArchive::new(Cursor::new(zip_data)).unwrap();
+
+        let temp = TempDir::new().unwrap();
+        let config = SecurityConfig::default()
+            .with_allow_absolute_paths(true)
+            .validate()
+            .expect("valid config");
 
         let report = archive
             .extract(
@@ -1840,6 +1921,87 @@ mod tests {
         zip.finish().unwrap().into_inner()
     }
 
+    const LOCAL_HEADER_SIGNATURE: [u8; 4] = *b"PK\x03\x04";
+    const CENTRAL_HEADER_SIGNATURE: [u8; 4] = *b"PK\x01\x02";
+
+    /// Offset of the second header starting with `signature`.
+    fn second_header_offset(data: &[u8], signature: [u8; 4]) -> usize {
+        data.windows(4)
+            .enumerate()
+            .filter(|(_, w)| **w == signature)
+            .nth(1)
+            .map(|(i, _)| i)
+            .expect("second header present")
+    }
+
+    /// Sets the declared compressed size of the second local and central
+    /// header to `size`.
+    fn forge_second_entry_compressed_size(data: &mut [u8], size: u32) {
+        for (signature, offset) in [(LOCAL_HEADER_SIGNATURE, 18), (CENTRAL_HEADER_SIGNATURE, 20)] {
+            let at = second_header_offset(data, signature);
+            data[at + offset..at + offset + 4].copy_from_slice(&size.to_le_bytes());
+        }
+    }
+
+    /// Issue #625: an oversized declared compressed size on a later entry must
+    /// fail when the archive is opened, before the earlier valid entry is
+    /// written.
+    #[test]
+    fn test_declared_compressed_size_violation_fails_before_any_write() {
+        let mut data = create_test_zip(vec![("a.txt", &[1u8; 64]), ("b.txt", &[2u8; 64])]);
+        forge_second_entry_compressed_size(&mut data, 400_000);
+
+        let result = ZipArchive::new(Cursor::new(data.clone()));
+        assert_matches!(result.err(), Some(ArchiveError::InvalidArchive(_)));
+
+        let dir = TempDir::new().unwrap();
+        let archive_path = dir.path().join("forged.zip");
+        std::fs::write(&archive_path, &data).unwrap();
+        let out = dir.path().join("out");
+        std::fs::create_dir(&out).unwrap();
+
+        let result = crate::extract_archive(&archive_path, &out, &SecurityConfig::default());
+        assert_matches!(result, Err(ArchiveError::InvalidArchive(_)));
+        assert_eq!(
+            std::fs::read_dir(&out).unwrap().count(),
+            0,
+            "no entry may be written before the size check fails"
+        );
+    }
+
+    /// Issue #625: the open-time pass reads every local header, so a corrupt
+    /// header with an intact central directory fails before any write.
+    #[test]
+    fn test_corrupt_local_header_fails_before_any_write() {
+        let mut data = create_test_zip(vec![("a.txt", &[1u8; 64]), ("b.txt", &[2u8; 64])]);
+        let at = second_header_offset(&data, LOCAL_HEADER_SIGNATURE);
+        data[at..at + 4].fill(0);
+
+        let dir = TempDir::new().unwrap();
+        let archive_path = dir.path().join("corrupt.zip");
+        std::fs::write(&archive_path, &data).unwrap();
+        let out = dir.path().join("out");
+        std::fs::create_dir(&out).unwrap();
+
+        let result = crate::extract_archive(&archive_path, &out, &SecurityConfig::default());
+        assert_matches!(result, Err(ArchiveError::InvalidArchive(_)));
+        assert_eq!(std::fs::read_dir(&out).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn test_is_password_required_matches_typed_variants_only() {
+        use ::zip::result::ZipError;
+
+        assert!(is_password_required(&ZipError::UnsupportedArchive(
+            ZipError::PASSWORD_REQUIRED
+        )));
+        assert!(is_password_required(&ZipError::InvalidPassword));
+        assert!(!is_password_required(&ZipError::FileNotFound));
+        assert!(!is_password_required(&ZipError::UnsupportedArchive(
+            "password mentioned elsewhere"
+        )));
+    }
+
     #[test]
     fn test_password_protected_large_archive_first_entry() {
         // Encrypted entry at index 0 — detected by full scan.
@@ -2511,74 +2673,155 @@ mod tests {
 
     // --- resolve_entry_path unit tests ---
 
+    fn strict_config() -> SecurityConfig<Validated> {
+        SecurityConfig::default().validate().unwrap()
+    }
+
+    fn absolute_config() -> SecurityConfig<Validated> {
+        SecurityConfig::default()
+            .with_allow_absolute_paths(true)
+            .validate()
+            .unwrap()
+    }
+
     /// Builds a minimal in-memory ZIP with a single entry named `entry_name`
     /// and empty content, then opens it and calls `resolve_entry_path` on the
     /// first entry, returning the result.
-    fn call_resolve_entry_path(entry_name: &str, allow_absolute_paths: bool) -> Result<PathBuf> {
+    fn call_resolve_entry_path(
+        entry_name: &str,
+        config: &SecurityConfig<Validated>,
+    ) -> Result<PathBuf> {
         let zip_data = create_raw_zip_entry(entry_name, b"");
         let cursor = Cursor::new(zip_data);
         let mut reader = zip::ZipArchive::new(cursor).unwrap();
         let zip_file = reader.by_index(0).unwrap();
-        ZipArchive::<Cursor<Vec<u8>>>::resolve_entry_path(&zip_file, 0, allow_absolute_paths)
+        ZipArchive::<Cursor<Vec<u8>>>::resolve_entry_path(&zip_file, 0, config)
     }
 
     #[test]
     fn test_resolve_entry_path_normal_relative_path() {
-        let path = call_resolve_entry_path("some/file.txt", false).unwrap();
+        let path = call_resolve_entry_path("some/file.txt", &strict_config()).unwrap();
         assert_eq!(path, PathBuf::from("some/file.txt"));
     }
 
     #[test]
-    fn test_resolve_entry_path_absolute_rejected_without_flag() {
-        // `create_raw_zip_entry` stores the name verbatim; zip crate's
-        // enclosed_name() returns None for names that start with `/` and
-        // contain traversal components.  For a plain `/etc/passwd` the zip
-        // crate 8.x actually returns Some("etc/passwd") via enclosed_name(),
-        // so we need a name that enclosed_name() will reject: use
-        // `/../etc/passwd`.
-        let result = call_resolve_entry_path("/../etc/passwd", false);
-        assert_matches!(
-            result,
-            Err(ArchiveError::PathTraversal { .. }),
-            "expected PathTraversal without allow_absolute_paths, got: {result:?}"
-        );
-    }
-
-    #[test]
-    fn test_resolve_entry_path_absolute_with_flag_strips_slash() {
-        // When allow_absolute_paths is true and enclosed_name() returns None,
-        // we strip the leading `/` and return the remainder.
-        // We need a path that enclosed_name() rejects but is still safe after
-        // stripping: the zip crate rejects names that are rooted AND contain
-        // `..`. Use `/../safe/path` — after stripping `/` and rejecting `..` we
-        // get PathTraversal. Instead, synthesize a raw ZIP where
-        // enclosed_name() returns None for a pure `/abs` path by crafting the
-        // bytes manually, bypassing zip crate's writer normalization.
-        // The simplest approach: use the existing raw_zip_with_custom_entry
-        // helper.
-        let zip_bytes = raw_zip_with_custom_entry("/../etc/shadow", b"", 0, 0, 0o100_644);
-        let cursor = Cursor::new(zip_bytes);
-        let result = zip::ZipArchive::new(cursor);
-        if let Ok(mut reader) = result {
-            let zip_file = reader.by_index(0).unwrap();
-            // with allow_absolute_paths: the `..` component must still be
-            // rejected
-            let result = ZipArchive::<Cursor<Vec<u8>>>::resolve_entry_path(&zip_file, 0, true);
+    fn test_resolve_entry_path_absolute_forms_rejected_by_default() {
+        for name in [
+            "/etc/passwd",
+            "\\etc\\passwd",
+            "C:\\x",
+            "C:/x",
+            "\\\\server\\share\\f",
+        ] {
+            let result = call_resolve_entry_path(name, &strict_config());
             assert_matches!(
                 result,
                 Err(ArchiveError::PathTraversal { .. }),
-                "traversal after root must be rejected even with allow_absolute_paths"
+                "{name:?} must be rejected without allow_absolute_paths"
             );
         }
     }
 
     #[test]
-    fn test_resolve_entry_path_traversal_rejected_without_flag() {
-        let result = call_resolve_entry_path("../escape.txt", false);
-        assert_matches!(
-            result,
-            Err(ArchiveError::PathTraversal { .. }),
-            "expected PathTraversal for ../escape.txt, got: {result:?}"
-        );
+    fn test_resolve_entry_path_absolute_forms_stripped_with_flag() {
+        for (name, expected) in [
+            ("/etc/passwd", "etc/passwd"),
+            ("\\etc\\passwd", "etc/passwd"),
+            ("C:\\x", "x"),
+            ("C:/dir/x", "dir/x"),
+        ] {
+            let path = call_resolve_entry_path(name, &absolute_config()).unwrap();
+            assert_eq!(path, PathBuf::from(expected), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn test_resolve_entry_path_absolute_resolving_to_nothing_rejected_with_flag() {
+        for name in ["/", "C:\\", "\\\\server\\share"] {
+            let result = call_resolve_entry_path(name, &absolute_config());
+            assert_matches!(
+                result,
+                Err(ArchiveError::PathTraversal { .. }),
+                "{name:?} resolves to an empty path and must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_resolve_entry_path_drive_glued_to_name_depends_on_platform() {
+        let result = call_resolve_entry_path("a:notes.txt", &strict_config());
+        if cfg!(windows) {
+            assert_matches!(result, Err(ArchiveError::PathTraversal { .. }));
+            let path = call_resolve_entry_path("a:notes.txt", &absolute_config()).unwrap();
+            assert_eq!(path, PathBuf::from("notes.txt"));
+        } else {
+            assert_eq!(result.unwrap(), PathBuf::from("a:notes.txt"));
+            let path = call_resolve_entry_path("a:dir\\notes.txt", &absolute_config()).unwrap();
+            assert_eq!(path, PathBuf::from("a:dir/notes.txt"));
+        }
+    }
+
+    #[test]
+    fn test_resolve_entry_path_drive_with_separator_or_nothing_is_absolute_everywhere() {
+        for name in ["C:", "c:\\x", "Z:/x"] {
+            let result = call_resolve_entry_path(name, &strict_config());
+            assert_matches!(
+                result,
+                Err(ArchiveError::PathTraversal { .. }),
+                "{name:?} must be rejected on every platform"
+            );
+        }
+    }
+
+    #[test]
+    fn test_resolve_zip_entry_path_empty_name_is_invalid() {
+        for config in [strict_config(), absolute_config()] {
+            let result = resolve_zip_entry_path("", Some(PathBuf::new()), &config);
+            assert_matches!(result, Err(ArchiveError::InvalidArchive(_)));
+        }
+    }
+
+    #[test]
+    fn test_resolve_entry_path_parent_components_rejected_in_both_separators() {
+        for name in [
+            "../escape.txt",
+            "/../etc/shadow",
+            "a\\..\\..\\x",
+            "a/../b",
+            "a\\..\\b",
+        ] {
+            for config in [strict_config(), absolute_config()] {
+                let result = call_resolve_entry_path(name, &config);
+                assert_matches!(
+                    result,
+                    Err(ArchiveError::PathTraversal { .. }),
+                    "{name:?} must be rejected"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_resolve_zip_entry_path_nul_byte_is_security_violation() {
+        for config in [strict_config(), absolute_config()] {
+            for raw in ["a\0b.txt", "/a\0b.txt"] {
+                let result = resolve_zip_entry_path(raw, None, &config);
+                assert_matches!(
+                    result,
+                    Err(ArchiveError::SecurityViolation { .. }),
+                    "{raw:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_resolve_zip_entry_path_nul_byte_passes_through_in_verify_preflight() {
+        let config = SecurityConfig::default()
+            .with_relaxed_for_verify_preflight()
+            .validate()
+            .unwrap();
+        let path = resolve_zip_entry_path("a\0b.txt", None, &config).unwrap();
+        assert_eq!(path, PathBuf::from("a\0b.txt"));
     }
 }

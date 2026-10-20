@@ -11,10 +11,17 @@
 //! - **Xz** (.tar.xz, .txz): Best compression ratio, slowest
 //! - **Zstd** (.tar.zst, .tzst): Modern codec with good speed/ratio balance
 
+use std::io;
 use std::io::BufRead;
 use std::io::Read;
+use std::io::Write;
 
 use crate::Result;
+use crate::creation::compression::compression_level_to_bzip2;
+use crate::creation::compression::compression_level_to_flate2;
+use crate::creation::compression::compression_level_to_xz;
+use crate::creation::compression::compression_level_to_zstd;
+use crate::formats::tar_metadata_limit::DecoderMemoryExceeded;
 
 /// Compression codec for archive files.
 ///
@@ -100,20 +107,63 @@ impl CompressionCodec {
     /// This is the only codec-to-decoder mapping used for reading TAR
     /// streams. The `bufread` decoders take the caller's buffer as-is, so
     /// the caller decides the buffering once instead of each decoder adding
-    /// its own.
+    /// its own. `max_decoder_memory` bounds the xz decoder only; the other
+    /// codecs are bounded by their format.
     ///
     /// # Errors
     ///
     /// Returns an I/O error if the decoder cannot be initialised.
-    pub(crate) fn decoder<'r, R>(self, input: R) -> Result<Box<dyn Read + Send + 'r>>
+    pub(crate) fn decoder<'r, R>(
+        self,
+        input: R,
+        max_decoder_memory: u64,
+    ) -> Result<Box<dyn Read + Send + 'r>>
     where
         R: BufRead + Send + 'r,
     {
         Ok(match self {
             Self::Gzip => Box::new(flate2::bufread::GzDecoder::new(input)),
             Self::Bzip2 => Box::new(bzip2::bufread::BzDecoder::new(input)),
-            Self::Xz => Box::new(xz2::bufread::XzDecoder::new(input)),
+            Self::Xz => {
+                let stream = xz2::stream::Stream::new_stream_decoder(max_decoder_memory, 0)
+                    .map_err(io::Error::from)?;
+                Box::new(XzLimited {
+                    inner: xz2::bufread::XzDecoder::new_stream(input, stream),
+                    max: max_decoder_memory,
+                })
+            }
             Self::Zstd => Box::new(zstd::Decoder::with_buffer(input)?),
+        })
+    }
+
+    /// Wraps `out` in this codec's encoder.
+    ///
+    /// Write-side mirror of [`decoder`](Self::decoder) and the only
+    /// codec-to-encoder mapping used for creating TAR streams. `level` is the
+    /// user-facing 1-9 scale (`None` selects the codec default).
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the encoder cannot be initialised.
+    pub(crate) fn encoder<W: Write>(self, out: W, level: Option<u8>) -> Result<TarEncoder<W>> {
+        Ok(match self {
+            Self::Gzip => TarEncoder::Gzip(flate2::write::GzEncoder::new(
+                out,
+                compression_level_to_flate2(level),
+            )),
+            Self::Bzip2 => TarEncoder::Bzip2(bzip2::write::BzEncoder::new(
+                out,
+                compression_level_to_bzip2(level),
+            )),
+            Self::Xz => TarEncoder::Xz(xz2::write::XzEncoder::new(
+                out,
+                compression_level_to_xz(level),
+            )),
+            Self::Zstd => {
+                let mut enc = zstd::Encoder::new(out, compression_level_to_zstd(level))?;
+                enc.include_checksum(true)?;
+                TarEncoder::Zstd(enc)
+            }
         })
     }
 
@@ -134,6 +184,72 @@ impl CompressionCodec {
             Self::Bzip2 => "bzip2",
             Self::Xz => "xz",
             Self::Zstd => "zstd",
+        }
+    }
+}
+
+/// xz decoder that reports liblzma's memory-limit error as a typed
+/// [`DecoderMemoryExceeded`] so `budget_violation` can classify it.
+struct XzLimited<R> {
+    inner: xz2::bufread::XzDecoder<R>,
+    max: u64,
+}
+
+impl<R: BufRead> Read for XzLimited<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.inner.read(buf).map_err(|e| {
+            let mem_limit = e
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<xz2::stream::Error>())
+                .is_some_and(|err| matches!(err, xz2::stream::Error::MemLimit));
+            if mem_limit {
+                io::Error::other(DecoderMemoryExceeded { max: self.max })
+            } else {
+                e
+            }
+        })
+    }
+}
+
+/// A compressing writer for one of the [`CompressionCodec`]s.
+///
+/// Must be closed with [`finish`](Self::finish): dropping it can lose the
+/// trailing frame and any flush error.
+pub(crate) enum TarEncoder<W: Write> {
+    Gzip(flate2::write::GzEncoder<W>),
+    Bzip2(bzip2::write::BzEncoder<W>),
+    Xz(xz2::write::XzEncoder<W>),
+    Zstd(zstd::Encoder<'static, W>),
+}
+
+impl<W: Write> TarEncoder<W> {
+    /// Writes the trailer, flushes, and returns the inner writer.
+    pub(crate) fn finish(self) -> io::Result<W> {
+        match self {
+            Self::Gzip(e) => e.finish(),
+            Self::Bzip2(e) => e.finish(),
+            Self::Xz(e) => e.finish(),
+            Self::Zstd(e) => e.finish(),
+        }
+    }
+}
+
+impl<W: Write> Write for TarEncoder<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Gzip(e) => e.write(buf),
+            Self::Bzip2(e) => e.write(buf),
+            Self::Xz(e) => e.write(buf),
+            Self::Zstd(e) => e.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Gzip(e) => e.flush(),
+            Self::Bzip2(e) => e.flush(),
+            Self::Xz(e) => e.flush(),
+            Self::Zstd(e) => e.flush(),
         }
     }
 }
@@ -183,6 +299,8 @@ mod tests {
         }
     }
 
+    const TEST_MEM: u64 = 256 * 1024 * 1024;
+
     const ALL_CODECS: [CompressionCodec; 4] = [
         CompressionCodec::Gzip,
         CompressionCodec::Bzip2,
@@ -196,11 +314,30 @@ mod tests {
         for codec in ALL_CODECS {
             let mut out = Vec::new();
             codec
-                .decoder(std::io::Cursor::new(encode(codec, &data)))
+                .decoder(std::io::Cursor::new(encode(codec, &data)), TEST_MEM)
                 .unwrap()
                 .read_to_end(&mut out)
                 .unwrap();
             assert_eq!(out, data, "{}", codec.name());
+        }
+    }
+
+    #[test]
+    fn test_encoder_round_trips_every_codec_and_level() {
+        let data = b"hello encoder ".repeat(1000);
+        for codec in ALL_CODECS {
+            for level in [None, Some(1), Some(9)] {
+                let mut enc = codec.encoder(Vec::new(), level).unwrap();
+                enc.write_all(&data).unwrap();
+                let encoded = enc.finish().unwrap();
+                let mut out = Vec::new();
+                codec
+                    .decoder(std::io::Cursor::new(encoded), TEST_MEM)
+                    .unwrap()
+                    .read_to_end(&mut out)
+                    .unwrap();
+                assert_eq!(out, data, "{} {level:?}", codec.name());
+            }
         }
     }
 
@@ -212,7 +349,7 @@ mod tests {
             encoded.extend_from_slice(b"TRAILING-BYTES");
             let mut out = Vec::new();
             codec
-                .decoder(std::io::Cursor::new(encoded))
+                .decoder(std::io::Cursor::new(encoded), TEST_MEM)
                 .unwrap()
                 .read_to_end(&mut out)
                 .unwrap();
@@ -226,7 +363,7 @@ mod tests {
         encoded.extend_from_slice(&encode(CompressionCodec::Zstd, b"second"));
         let mut out = Vec::new();
         CompressionCodec::Zstd
-            .decoder(std::io::Cursor::new(encoded))
+            .decoder(std::io::Cursor::new(encoded), TEST_MEM)
             .unwrap()
             .read_to_end(&mut out)
             .unwrap();

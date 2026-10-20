@@ -23,6 +23,8 @@ use std::io::Read;
 use std::io::Write;
 use std::io::{self};
 
+use crate::formats::tar_metadata_limit::budget_violation;
+
 use crate::ArchiveError;
 
 /// Optimal buffer size for I/O operations (64KB).
@@ -35,7 +37,6 @@ const COPY_BUFFER_SIZE: usize = 64 * 1024;
 #[derive(Debug)]
 pub struct CopyBuffer {
     // Stack allocation is intentional for performance (avoids heap overhead)
-    #[allow(clippy::large_stack_arrays)]
     buf: [u8; COPY_BUFFER_SIZE],
 }
 
@@ -45,7 +46,10 @@ impl CopyBuffer {
     /// The buffer is allocated on the stack and zero-initialized.
     #[inline]
     #[must_use]
-    #[allow(clippy::large_stack_arrays)]
+    #[expect(
+        clippy::large_stack_arrays,
+        reason = "the copy buffer is deliberately a fixed-size array"
+    )]
     pub fn new() -> Self {
         Self {
             buf: [0u8; COPY_BUFFER_SIZE],
@@ -64,6 +68,19 @@ impl CopyBuffer {
 impl Default for CopyBuffer {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Error for a stream that decompressed past the archive's own declared size.
+///
+/// Shared by the streaming ceiling in [`copy_with_buffer`] and the ZIP
+/// reader's declared-size classification so the message stays identical.
+#[must_use]
+pub fn declared_size_exceeded(declared: u64) -> ArchiveError {
+    ArchiveError::SecurityViolation {
+        reason: format!(
+            "decompressed size exceeded the declared uncompressed size of {declared} bytes"
+        ),
     }
 }
 
@@ -129,7 +146,9 @@ pub fn copy_with_buffer<R: Read + ?Sized, W: Write + ?Sized>(
             Ok(0) => break,
             Ok(n) => n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(ArchiveError::Io(e)),
+            Err(e) => {
+                return Err(budget_violation(&e).unwrap_or(ArchiveError::Io(e)));
+            }
         };
 
         // SECURITY: Detect overflow to prevent quota bypass
@@ -153,12 +172,7 @@ pub fn copy_with_buffer<R: Read + ?Sized, W: Write + ?Sized>(
         if let Some(expected) = expected_size
             && total > expected
         {
-            return Err(ArchiveError::SecurityViolation {
-                reason: format!(
-                    "decompressed size exceeded the declared uncompressed size of \
-                     {expected} bytes"
-                ),
-            });
+            return Err(declared_size_exceeded(expected));
         }
 
         writer

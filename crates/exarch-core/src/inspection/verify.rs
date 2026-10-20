@@ -9,18 +9,19 @@ use crate::config::Validated;
 use crate::inspection::list::list_archive;
 use crate::inspection::manifest::ArchiveEntry;
 use crate::inspection::manifest::ArchiveManifest;
+use crate::inspection::manifest::ManifestEntryKind;
 use crate::inspection::manifest::ManifestEntryType;
 use crate::inspection::report::IssueCategory;
 use crate::inspection::report::IssueSeverity;
 use crate::inspection::report::VerificationIssue;
 use crate::inspection::report::VerificationReport;
+use crate::security::hardlink::HardlinkTracker;
 use crate::security::path::validate_path;
 use crate::security::permissions::sanitize_permissions;
 use crate::security::quota::QuotaTracker;
 use crate::security::symlink::validate_symlink;
-use crate::security::zipbomb::validate_compression_ratio;
+use crate::security::zipbomb::validate_entry_compression;
 use crate::types::DestDir;
-use crate::types::EntryType;
 
 /// Verifies an already-listed manifest against the security config.
 ///
@@ -35,9 +36,16 @@ pub(crate) fn verify_manifest(
     let temp_dest = DestDir::new(temp_dir.path())?;
 
     let mut quota_tracker = QuotaTracker::new();
+    let mut hardlink_tracker = HardlinkTracker::new();
 
     Ok(VerificationReport::from_entry_issues(manifest, |entry| {
-        let mut issues = verify_entry(entry, config, &temp_dest, &mut quota_tracker);
+        let mut issues = verify_entry(
+            entry,
+            config,
+            &temp_dest,
+            &mut quota_tracker,
+            &mut hardlink_tracker,
+        );
         issues.extend(check_heuristics(entry));
         issues
     }))
@@ -63,9 +71,14 @@ pub(crate) fn verify_manifest(
 /// - Archive file cannot be opened
 /// - Archive is severely corrupted (cannot read structure)
 /// - Declared compressed sizes exceed the archive length
+/// - An entry name is a path traversal (`..` component, or an absolute path
+///   unless `allowed.absolute_paths` is set): the listing step rejects it with
+///   [`ArchiveError::PathTraversal`] before a report exists
 ///
-/// Security violations are reported in `VerificationReport::issues`, not as
-/// errors.
+/// Other security violations are reported in `VerificationReport::issues`
+/// instead: disallowed links, link targets that escape the destination,
+/// quota and compression-ratio violations, NUL bytes, banned components and
+/// unsafe permissions.
 ///
 /// # Examples
 ///
@@ -132,20 +145,9 @@ fn verify_entry(
     config: &SecurityConfig<Validated>,
     dest: &DestDir,
     quota_tracker: &mut QuotaTracker,
+    hardlink_tracker: &mut HardlinkTracker,
 ) -> Vec<VerificationIssue> {
     let mut issues = Vec::new();
-
-    // Convert ManifestEntryType to EntryType
-    let entry_type = match entry.entry_type {
-        ManifestEntryType::File => EntryType::File,
-        ManifestEntryType::Directory => EntryType::Directory,
-        ManifestEntryType::Symlink => EntryType::Symlink {
-            target: entry.symlink_target.clone().unwrap_or_default(),
-        },
-        ManifestEntryType::Hardlink => EntryType::Hardlink {
-            target: entry.hardlink_target.clone().unwrap_or_default(),
-        },
-    };
 
     // Path validation — result cached to avoid repeated syscalls for
     // symlink/hardlink checks
@@ -160,36 +162,33 @@ fn verify_entry(
     }
 
     // Compression ratio validation (zip bomb detection)
-    if let Some(compressed_size) = entry.compressed_size
-        && let Err(e) = validate_compression_ratio(compressed_size, entry.size, config)
-    {
+    if let Err(e) = validate_entry_compression(&entry.compression, entry.size, config) {
         issues.push(VerificationIssue::from_error(&e, Some(entry.path.clone())));
     }
 
-    // Symlink validation
-    if let EntryType::Symlink { ref target } = entry_type
-        && let Ok(ref safe_link_path) = path_result
-        && let Err(e) = validate_symlink(safe_link_path, target, dest, config)
-    {
-        issues.push(VerificationIssue::from_error(&e, Some(entry.path.clone())));
-    }
-
-    // Hardlink validation (similar to symlink)
-    if let EntryType::Hardlink { ref target } = entry_type
-        && let Ok(ref safe_link_path) = path_result
-        && let Err(e) = validate_path(target, dest, config)
-    {
-        issues.push(VerificationIssue {
-            severity: IssueSeverity::Critical,
-            category: IssueCategory::HardlinkEscape,
-            entry_path: Some(entry.path.clone()),
-            message: format!(
-                "Hardlink target escapes destination: {} -> {}",
-                safe_link_path.as_path().display(),
-                target.display()
+    if let Ok(ref safe_link_path) = path_result {
+        let link_result = match &entry.kind {
+            ManifestEntryKind::Symlink { target } => Some(
+                target
+                    .as_deref()
+                    .ok_or_else(|| missing_link_target(ManifestEntryType::Symlink))
+                    .and_then(|t| validate_symlink(safe_link_path, t, dest, config).map(drop)),
             ),
-            context: Some(e.to_string()),
-        });
+            // TODO(#645): flag hardlinks whose target never appears earlier in the
+            // manifest (extract fails on them)
+            ManifestEntryKind::Hardlink { target } => Some(
+                target
+                    .as_deref()
+                    .ok_or_else(|| missing_link_target(ManifestEntryType::Hardlink))
+                    .and_then(|t| {
+                        hardlink_tracker.validate_hardlink(safe_link_path, t, dest, config)
+                    }),
+            ),
+            ManifestEntryKind::File | ManifestEntryKind::Directory => None,
+        };
+        if let Some(Err(e)) = link_result {
+            issues.push(VerificationIssue::from_error(&e, Some(entry.path.clone())));
+        }
     }
 
     // Permission validation
@@ -202,16 +201,18 @@ fn verify_entry(
     issues
 }
 
+fn missing_link_target(kind: ManifestEntryType) -> ArchiveError {
+    ArchiveError::SecurityViolation {
+        reason: format!("{} target is missing", kind.as_str().to_ascii_lowercase()),
+    }
+}
+
 fn check_permissions(path: &Path, mode: u32, config: &SecurityConfig<Validated>) -> Result<()> {
     let sanitized = sanitize_permissions(mode, config);
-    if sanitized.as_u32() == mode {
-        Ok(())
-    } else {
-        Err(ArchiveError::InvalidPermissions {
-            path: path.to_path_buf(),
-            mode,
-        })
-    }
+    (sanitized.as_u32() == mode).ok_or_else(|| ArchiveError::InvalidPermissions {
+        path: path.to_path_buf(),
+        mode,
+    })
 }
 
 fn check_heuristics(entry: &ArchiveEntry) -> Vec<VerificationIssue> {
@@ -220,7 +221,7 @@ fn check_heuristics(entry: &ArchiveEntry) -> Vec<VerificationIssue> {
     // Executable file detection
     if let Some(mode) = entry.mode
         && mode & 0o111 != 0
-        && entry.entry_type == ManifestEntryType::File
+        && entry.kind == ManifestEntryKind::File
     {
         issues.push(VerificationIssue {
             severity: IssueSeverity::Low,
@@ -280,6 +281,7 @@ fn is_suspicious_extension(path: &Path) -> bool {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::inspection::manifest::EntryCompression;
     use crate::inspection::report::VerificationStatus;
     use crate::test_utils::tar_with_pax_nul_path;
     use std::assert_matches;
@@ -304,13 +306,11 @@ mod tests {
     fn test_check_heuristics_executable() {
         let entry = crate::inspection::manifest::ArchiveEntry {
             path: PathBuf::from("test.sh"),
-            entry_type: ManifestEntryType::File,
+            kind: ManifestEntryKind::File,
             size: 100,
-            compressed_size: None,
+            compression: EntryCompression::Unknown,
             mode: Some(0o755),
             modified: None,
-            symlink_target: None,
-            hardlink_target: None,
         };
 
         let issues = check_heuristics(&entry);
@@ -326,13 +326,11 @@ mod tests {
     fn test_check_heuristics_suspicious_extension() {
         let entry = crate::inspection::manifest::ArchiveEntry {
             path: PathBuf::from("malware.exe"),
-            entry_type: ManifestEntryType::File,
+            kind: ManifestEntryKind::File,
             size: 100,
-            compressed_size: None,
+            compression: EntryCompression::Unknown,
             mode: Some(0o644),
             modified: None,
-            symlink_target: None,
-            hardlink_target: None,
         };
 
         let issues = check_heuristics(&entry);
@@ -352,13 +350,11 @@ mod tests {
 
         let entry = crate::inspection::manifest::ArchiveEntry {
             path: PathBuf::from(OsStr::from_bytes(b"weird-\xFF\xFE-name.txt")),
-            entry_type: ManifestEntryType::File,
+            kind: ManifestEntryKind::File,
             size: 100,
-            compressed_size: None,
+            compression: EntryCompression::Unknown,
             mode: Some(0o644),
             modified: None,
-            symlink_target: None,
-            hardlink_target: None,
         };
 
         let issues = check_heuristics(&entry);
@@ -374,13 +370,11 @@ mod tests {
     fn test_check_heuristics_valid_utf8_name_no_warning() {
         let entry = crate::inspection::manifest::ArchiveEntry {
             path: PathBuf::from("safe/file.txt"),
-            entry_type: ManifestEntryType::File,
+            kind: ManifestEntryKind::File,
             size: 100,
-            compressed_size: None,
+            compression: EntryCompression::Unknown,
             mode: Some(0o644),
             modified: None,
-            symlink_target: None,
-            hardlink_target: None,
         };
 
         let issues = check_heuristics(&entry);
@@ -581,9 +575,7 @@ mod tests {
     // `test_list_tar_hardlink_missing_target_rejected` in
     // `inspection::list::tests`). `relaxed_for_verify_preflight` lets the
     // missing target through the pre-flight listing pass as `None`;
-    // `verify_entry` then treats it as an empty target via
-    // `unwrap_or_default()`, which `validate_path` rejects with its own
-    // pre-existing "empty path not allowed" check.
+    // `verify_entry` reports it as a SecurityPolicy issue.
     #[test]
     fn test_verify_archive_hardlink_missing_target_reports_issue_not_error() {
         let mut temp_file = NamedTempFile::with_suffix(".tar").unwrap();
@@ -600,7 +592,8 @@ mod tests {
         temp_file.write_all(&archive_data).unwrap();
         temp_file.flush().unwrap();
 
-        let config = SecurityConfig::default();
+        let mut config = SecurityConfig::default();
+        config.allowed.hardlinks = true;
         let report = verify_archive(temp_file.path(), &config)
             .expect("verify_archive must report a missing hardlink target, not error out");
 
@@ -612,14 +605,128 @@ mod tests {
         assert_eq!(report.suspicious_entries(), 1);
         assert!(
             report.issues().iter().any(|i| {
-                i.category == IssueCategory::HardlinkEscape
-                    && i.context
-                        .as_deref()
-                        .is_some_and(|c| c.contains("empty path not allowed"))
+                i.category == IssueCategory::SecurityPolicy
+                    && i.message.contains("hardlink target is missing")
             }),
-            "expected a HardlinkEscape issue citing the empty target, got: {:?}",
+            "expected a SecurityPolicy issue citing the missing target, got: {:?}",
             report.issues()
         );
+    }
+
+    fn link_tar(
+        entry_type: tar::EntryType,
+        names_and_targets: &[(&str, Option<&str>)],
+    ) -> NamedTempFile {
+        let mut temp_file = NamedTempFile::with_suffix(".tar").unwrap();
+        let mut builder = tar::Builder::new(Vec::new());
+        for (name, target) in names_and_targets {
+            let mut header = tar::Header::new_gnu();
+            header.set_path(name).unwrap();
+            header.set_size(0);
+            header.set_entry_type(entry_type);
+            if let Some(target) = target {
+                header.set_link_name(target).unwrap();
+            }
+            header.set_cksum();
+            builder.append(&header, &[][..]).unwrap();
+        }
+        temp_file.write_all(&builder.into_inner().unwrap()).unwrap();
+        temp_file.flush().unwrap();
+        temp_file
+    }
+
+    fn hardlink_config(allowed: bool) -> SecurityConfig {
+        let mut config = SecurityConfig::default();
+        config.allowed.hardlinks = allowed;
+        config
+    }
+
+    #[test]
+    fn test_verify_hardlink_rejected_when_not_allowed() {
+        let archive = link_tar(tar::EntryType::Link, &[("link", Some("target.txt"))]);
+        let report = verify_archive(archive.path(), &hardlink_config(false)).unwrap();
+
+        assert_eq!(report.status(), VerificationStatus::Fail);
+        assert_eq!(report.security_status(), crate::CheckStatus::Fail);
+        assert!(report.issues().iter().any(|i| {
+            i.category == IssueCategory::SecurityPolicy
+                && i.message.contains("hardlinks not allowed")
+        }));
+    }
+
+    #[test]
+    fn test_verify_hardlink_inside_dest_passes_when_allowed() {
+        let archive = link_tar(tar::EntryType::Link, &[("link", Some("target.txt"))]);
+        let report = verify_archive(archive.path(), &hardlink_config(true)).unwrap();
+
+        assert!(
+            !report.issues().iter().any(|i| i.category.is_security()),
+            "got: {:?}",
+            report.issues()
+        );
+    }
+
+    #[test]
+    fn test_verify_hardlink_duplicate_target_passes_when_allowed() {
+        let archive = link_tar(
+            tar::EntryType::Link,
+            &[("a", Some("target.txt")), ("b", Some("target.txt"))],
+        );
+        let report = verify_archive(archive.path(), &hardlink_config(true)).unwrap();
+
+        assert!(!report.issues().iter().any(|i| i.category.is_security()));
+    }
+
+    #[test]
+    fn test_verify_hardlink_target_escaping_dest_flagged() {
+        let archive = link_tar(tar::EntryType::Link, &[("link", Some("../outside.txt"))]);
+        let report = verify_archive(archive.path(), &hardlink_config(true)).unwrap();
+
+        assert_eq!(report.status(), VerificationStatus::Fail);
+        assert!(
+            report
+                .issues()
+                .iter()
+                .any(|i| i.category == IssueCategory::HardlinkEscape),
+            "got: {:?}",
+            report.issues()
+        );
+    }
+
+    #[test]
+    fn test_verify_hardlink_absolute_target_flagged() {
+        let archive = link_tar(tar::EntryType::Link, &[("link", Some("/etc/passwd"))]);
+        let report = verify_archive(archive.path(), &hardlink_config(true)).unwrap();
+
+        assert_eq!(report.status(), VerificationStatus::Fail);
+        assert!(
+            report
+                .issues()
+                .iter()
+                .any(|i| i.category == IssueCategory::HardlinkEscape),
+            "got: {:?}",
+            report.issues()
+        );
+    }
+
+    #[test]
+    fn test_verify_symlink_missing_target_reports_policy_issue() {
+        for allowed in [false, true] {
+            let archive = link_tar(tar::EntryType::Symlink, &[("link", None)]);
+            let mut config = SecurityConfig::default();
+            config.allowed.symlinks = allowed;
+            let report = verify_archive(archive.path(), &config).unwrap();
+
+            assert_eq!(report.status(), VerificationStatus::Fail);
+            assert!(
+                report.issues().iter().any(|i| {
+                    i.category == IssueCategory::SecurityPolicy
+                        && i.message.contains("symlink target is missing")
+                }),
+                "allowed={allowed}, got: {:?}",
+                report.issues()
+            );
+        }
     }
 
     // Note: Full CVE regression tests for path traversal require real malicious
@@ -660,10 +767,8 @@ mod tests {
         assert_eq!(report.suspicious_entries(), 1);
         assert!(!report.issues().is_empty(), "Should detect symlink");
 
-        // Symlink is blocked by default config (SecurityViolation ->
-        // SuspiciousPath category)
         let has_symlink_issue = report.issues().iter().any(|i| {
-            matches!(i.category, IssueCategory::SuspiciousPath) && i.message.contains("symlink")
+            matches!(i.category, IssueCategory::SecurityPolicy) && i.message.contains("symlink")
         });
 
         assert!(

@@ -69,7 +69,7 @@ pub struct ExtractArgs {
     #[arg(long, value_parser = parse_byte_size)]
     pub max_file_size: Option<u64>,
 
-    /// Maximum compression ratio
+    /// Maximum compression ratio (not applied to solid 7z blocks, fixed 1000x)
     #[arg(long, default_value = "100", value_parser = clap::value_parser!(u32).range(1..))]
     pub max_compression_ratio: u32,
 
@@ -241,7 +241,10 @@ pub struct VerifyArgs {
 }
 
 /// Parse byte size with optional suffix (K, M, G, T)
-#[allow(clippy::option_if_let_else)]
+#[expect(
+    clippy::option_if_let_else,
+    reason = "if-let chain reads clearer than map_or_else here"
+)]
 fn parse_byte_size(s: &str) -> Result<u64, String> {
     let s = s.trim();
     if s.is_empty() {

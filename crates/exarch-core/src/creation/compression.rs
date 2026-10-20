@@ -123,7 +123,10 @@ pub fn compression_level_to_xz(level: Option<u8>) -> u32 {
 /// let best_level = compression_level_to_zstd(Some(9));
 /// assert_eq!(best_level, 19);
 /// ```
-#[allow(clippy::match_same_arms)] // Different semantic meanings for each level
+#[expect(
+    clippy::match_same_arms,
+    reason = "arms are kept separate to document each level's meaning"
+)]
 #[must_use]
 pub fn compression_level_to_zstd(level: Option<u8>) -> i32 {
     match level {
@@ -137,25 +140,6 @@ pub fn compression_level_to_zstd(level: Option<u8>) -> i32 {
         // All other levels (3-5, 0, 10+) map to default
         _ => 3,
     }
-}
-
-/// Unified compression level type.
-///
-/// This enum wraps codec-specific compression level types to provide
-/// a unified interface for compression level conversion.
-#[derive(Debug, Clone, Copy)]
-pub enum CompressionLevel {
-    /// Flate2 (gzip) compression level.
-    Flate2(flate2::Compression),
-
-    /// Bzip2 compression level.
-    Bzip2(bzip2::Compression),
-
-    /// Xz compression level (raw u32).
-    Xz(u32),
-
-    /// Zstd compression level (raw i32).
-    Zstd(i32),
 }
 
 #[cfg(test)]

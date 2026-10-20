@@ -211,6 +211,9 @@ export declare class SecurityConfig {
   /**
    * Sets the maximum compression ratio.
    *
+   * Solid 7z blocks are exempt: each block is checked as a whole against a
+   * fixed 1000x limit that is configurable only from the Rust API.
+   *
    * # Errors
    *
    * Returns error if ratio is not a positive finite number.
@@ -342,7 +345,7 @@ export interface ArchiveEntry {
   entryType: ManifestEntryType
   /** Uncompressed size in bytes (0 for directories). */
   size: number
-  /** Compressed size in bytes (if available, ZIP only). */
+  /** Compressed size in bytes (if the format reports one). */
   compressedSize?: number
   /** File permissions (Unix mode). */
   mode?: number
@@ -852,7 +855,7 @@ export interface ExtractionReport {
 }
 
 /** Issue category. */
-export type IssueCategory = 'Path Traversal' | 'Symlink Escape' | 'Hardlink Escape' | 'Zip Bomb' | 'Invalid Permissions' | 'Quota Exceeded' | 'Invalid Archive' | 'Suspicious Path' | 'Executable File'
+export type IssueCategory = 'Path Traversal' | 'Symlink Escape' | 'Hardlink Escape' | 'Zip Bomb' | 'Invalid Permissions' | 'Quota Exceeded' | 'Security Policy' | 'Invalid Archive' | 'Suspicious Path' | 'Executable File'
 
 /** Issue severity. */
 export type IssueSeverity = 'INFO' | 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL'

@@ -18,7 +18,7 @@ _ManifestEntryType = Literal["File", "Directory", "Symlink", "Hardlink"]
 _VerificationStatus = Literal["PASS", "FAIL", "WARNING"]
 _CheckStatus = Literal["OK", "FAILED", "WARNING", "SKIPPED"]
 _IssueSeverity = Literal["INFO", "LOW", "MEDIUM", "HIGH", "CRITICAL"]
-_IssueCategory = Literal["Path Traversal", "Symlink Escape", "Hardlink Escape", "Zip Bomb", "Invalid Permissions", "Quota Exceeded", "Invalid Archive", "Suspicious Path", "Executable File"]  # noqa: E501  # fmt: skip
+_IssueCategory = Literal["Path Traversal", "Symlink Escape", "Hardlink Escape", "Zip Bomb", "Invalid Permissions", "Quota Exceeded", "Security Policy", "Invalid Archive", "Suspicious Path", "Executable File"]  # noqa: E501  # fmt: skip
 
 class SecurityConfig:
     """
@@ -55,7 +55,11 @@ class SecurityConfig:
         ...
 
     def with_max_compression_ratio(self, ratio: float) -> SecurityConfig:
-        """Sets the maximum compression ratio."""
+        """Sets the maximum compression ratio.
+
+        Solid 7z blocks are exempt: each block is checked as a whole against a
+        fixed 1000x limit that is configurable only from the Rust API.
+        """
         ...
 
     def with_max_file_count(self, count: int) -> SecurityConfig:
@@ -135,7 +139,10 @@ class SecurityConfig:
     def max_total_size(self, value: int) -> None: ...
     @property
     def max_compression_ratio(self) -> float:
-        """Maximum compression ratio allowed (default: 100.0)."""
+        """Maximum compression ratio allowed (default: 100.0).
+
+        Not applied to solid 7z blocks, which use a fixed 1000x limit.
+        """
         ...
 
     @max_compression_ratio.setter
@@ -455,7 +462,12 @@ class ArchiveEntry:
 
     @property
     def compressed_size(self) -> int | None:
-        """Compressed size in bytes (if available)."""
+        """
+        Compressed size in bytes (if available).
+
+        For the first file of a solid 7z block this is the whole block's
+        compressed size; other solid members report None.
+        """
         ...
 
     @property
@@ -474,7 +486,12 @@ class ArchiveEntry:
         ...
 
     def compression_ratio(self) -> float | None:
-        """Returns the compression ratio if compressed size is available."""
+        """
+        Returns the compression ratio if the entry owns its compressed data.
+
+        None for TAR, empty entries and solid 7z members (including the
+        block start, whose ratio is checked per block).
+        """
         ...
 
 class ArchiveManifest:
