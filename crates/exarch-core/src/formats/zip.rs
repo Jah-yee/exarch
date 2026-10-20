@@ -161,9 +161,9 @@ use super::zip_structure;
 use super::zip_structure::Shared;
 use super::zip_structure::ZipStructure;
 
-/// Maximum symlink target length read from a ZIP entry: `PATH_MAX`, to prevent
-/// unbounded allocation.
-const MAX_SYMLINK_TARGET_SIZE: u64 = crate::security::fs_view::MAX_PATH_BYTES as u64;
+/// Maximum symlink target length read from a ZIP entry: the host's path
+/// limit, to prevent unbounded allocation.
+const MAX_SYMLINK_TARGET_SIZE: u64 = crate::security::fs_view::MAX_PATH_LEN as u64;
 
 /// Message of the `io::Error` the `zip` crate (>= 9.0.1) raises when an entry
 /// decompresses past its declared size.
@@ -797,7 +797,7 @@ impl ZipEntryAdapter {
         Self::check_symlink_target_size(size)?;
 
         // SAFETY: size has already been validated to be <=
-        // MAX_SYMLINK_TARGET_SIZE (4096) which is well within usize
+        // MAX_SYMLINK_TARGET_SIZE which is well within usize
         // range on all platforms
         #[allow(clippy::cast_possible_truncation)]
         let mut target_bytes = Vec::with_capacity(size as usize);
@@ -1969,7 +1969,7 @@ mod tests {
         // content. The size field in the local header is what our code
         // reads via zip_file.size(). We need actual content bytes so
         // the zip crate reports the correct uncompressed size.
-        let target = vec![b'a'; 4097];
+        let target = vec![b'a'; crate::test_utils::HOST_PATH_LIMIT + 1];
         let zip_bytes = raw_zip_with_custom_entry("link", &target, 0, 0, 0o120_777);
         let cursor = Cursor::new(zip_bytes);
         // The archive itself should open fine.
@@ -1994,6 +1994,32 @@ mod tests {
                 "expected SecurityViolation(symlink target too large), got: {err:?}"
             );
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_symlink_entry_is_refused_on_windows() {
+        let target = vec![b'a'; 16];
+        let zip_bytes = raw_zip_with_custom_entry("link", &target, 0, 0, 0o120_777);
+        let mut archive = ZipArchive::new(Cursor::new(zip_bytes)).unwrap();
+        let temp = TempDir::new().unwrap();
+        let mut config = SecurityConfig::default();
+        config.allowed.symlinks = true;
+        let config = config.validate().expect("valid config");
+        let err = archive
+            .extract(
+                temp.path(),
+                &config,
+                &ExtractionOptions::default(),
+                &mut crate::NoopProgress,
+            )
+            .unwrap_err();
+        assert_matches!(
+            err,
+            ArchiveError::SecurityViolation { ref reason }
+                if reason.contains("not supported on this platform"),
+            "{err:?}"
+        );
     }
 
     #[test]
