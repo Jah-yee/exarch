@@ -79,15 +79,23 @@ impl VerificationReport {
     /// # Ok::<(), exarch_core::ArchiveError>(())
     /// ```
     #[must_use]
-    pub fn from_entry_issues<F>(manifest: &ArchiveManifest, mut issues_for: F) -> Self
+    pub fn from_entry_issues<F>(manifest: &ArchiveManifest, issues_for: F) -> Self
     where
         F: FnMut(&ArchiveEntry) -> Vec<VerificationIssue>,
     {
+        let lists = manifest.entries().iter().map(issues_for).collect();
+        Self::from_entry_issue_lists(manifest, lists)
+    }
+
+    /// Builds a report from one precomputed issue list per manifest entry.
+    pub(crate) fn from_entry_issue_lists(
+        manifest: &ArchiveManifest,
+        lists: Vec<Vec<VerificationIssue>>,
+    ) -> Self {
         let mut issues = Vec::new();
         let mut suspicious_entries = 0;
 
-        for entry in manifest.entries() {
-            let entry_issues = issues_for(entry);
+        for entry_issues in lists {
             if entry_issues
                 .iter()
                 .any(|i| i.severity >= IssueSeverity::Medium)
@@ -312,16 +320,10 @@ impl VerificationIssue {
                 IssueCategory::HardlinkEscape,
                 format!("Hardlink escape: {}", path.display()),
             ),
-            ArchiveError::ZipBomb {
-                compressed,
-                uncompressed,
-                ratio,
-            } => (
+            ArchiveError::ZipBomb(details) => (
                 IssueSeverity::Critical,
                 IssueCategory::ZipBomb,
-                format!(
-                    "Potential zip bomb: {ratio:.1}x compression ratio (compressed={compressed}, uncompressed={uncompressed})"
-                ),
+                format!("Potential zip bomb: {details}"),
             ),
             ArchiveError::QuotaExceeded { resource } => (
                 IssueSeverity::High,
@@ -483,6 +485,8 @@ impl IssueCategory {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::ZipBombDetails;
+    use crate::ZipBombScope;
     use std::io;
 
     use crate::inspection::manifest::ManifestEntryKind;
@@ -601,11 +605,8 @@ mod tests {
 
     #[test]
     fn test_verification_issue_from_zip_bomb() {
-        let error = ArchiveError::ZipBomb {
-            compressed: 1000,
-            uncompressed: 1_000_000,
-            ratio: 1000.0,
-        };
+        let error =
+            ArchiveError::ZipBomb(ZipBombDetails::new(ZipBombScope::Entry, 1000, 1_000_000));
         let issue = VerificationIssue::from_error(&error, None);
 
         assert_eq!(issue.severity, IssueSeverity::Critical);
