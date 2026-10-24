@@ -144,11 +144,13 @@ fn pattern_matches(s: &str, pattern: &str) -> bool {
 /// Applies `strip_prefix` if configured. The archive path is relative
 /// to the root directory being archived.
 ///
+/// # Errors
+///
 /// Returns an error if the source path is not under the root directory.
 ///
-/// A configured `strip_prefix` that does not match the relative path is
-/// ignored for that entry; the unstripped relative path is used.
-
+/// A `strip_prefix` that does not match the computed relative path is
+/// ignored; the unstripped relative path is used.
+///
 /// # Examples
 ///
 /// ```
